@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
-import { keyHash } from '../src/tablets.js';
 const base = process.env.BASE_URL || 'http://127.0.0.1:9876';
 const auth = process.env.API_TOKEN ? { authorization: `Bearer ${process.env.API_TOKEN}` } : {};
 async function query(sql, extra = {}, expected = 200) {
@@ -10,6 +9,7 @@ async function query(sql, extra = {}, expected = 200) {
   assert.equal(response.status, expected, `${sql.slice(0, 300)}: ${JSON.stringify(value)}`);
   return value;
 }
+async function frontier(){const response=await fetch(`${base}/snapshot`,{method:'POST',headers:{'content-type':'application/json',...auth},body:'{}'});assert.equal(response.status,200);return (await response.json()).frontier;}
 const rows = result => result.results.at(-1).rows;
 const routing = (result, table) => result.routing.find(route => route.table === table);
 const create = table => `CREATE TABLE ${table} (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL, tag TEXT NOT NULL, email TEXT NOT NULL, payload TEXT)`;
@@ -40,12 +40,13 @@ if (mode === '--migration-seed') {
   const previous = routing(await query(`SELECT * FROM ${table}`), table);
   assert.ok(previous.tablets.length > 1);
   assert.ok(previous.indexes[0].tablets.length > 1);
+  const before = await frontier();
   const sql = `DELETE FROM ${table} WHERE id > 1`, idempotencyKey = randomUUID();
   await query(sql, { idempotencyKey, fault:'after-first-commit' }, 503);
-  await writeFile(manifest, JSON.stringify({table,sql,idempotencyKey,previous}));
+  await writeFile(manifest, JSON.stringify({table,sql,idempotencyKey,previous,before}));
   console.log('PASS ordered base/index tablet merge partially committed for SIGKILL');
 } else if (mode === '--merge-verify') {
-  const {table,sql,idempotencyKey,previous}=JSON.parse(await readFile(manifest,'utf8'));
+  const {table,sql,idempotencyKey,previous,before}=JSON.parse(await readFile(manifest,'utf8'));
   const replay=await query(sql,{idempotencyKey}), current=routing(replay,table);
   assert.equal(current.tablets.length,1);
   assert.equal(current.indexes[0].tablets.length,1);
@@ -54,26 +55,27 @@ if (mode === '--migration-seed') {
   assert.deepEqual(rows(indexed),[{id:1}]);assert.equal(indexed.plan.type,'index-range');
   assert.equal(indexed.plan.indexTabletsTotal,1);
   assert.deepEqual(rows(await query(`SELECT id FROM ${table} WHERE email = 'person17'`)),[]);
-  const retired=previous.tablets.find(old=>!current.tablets.some(next=>next.id===old.id));
-  assert.ok(retired);
-  const stale=await fetch(`${base}/debug/tablet`,{method:'POST',headers:{'content-type':'application/json',...auth},body:JSON.stringify({table,tablet:retired.id,epoch:previous.epoch})});
-  assert.equal(stale.status,409);assert.equal((await stale.json()).code,'STALE_EPOCH');
+  const historical=await query(`SELECT id FROM ${table} ORDER BY id`,{snapshot:before});
+  assert.equal(rows(historical).length,64);
+  assert.equal(routing(historical,table).tablets.length,previous.tablets.length);
+  const oldIndex=await query(`SELECT id FROM ${table} WHERE email = 'person17'`,{snapshot:before});
+  assert.deepEqual(rows(oldIndex),[{id:17}]);
   assert.deepEqual(await query(sql,{idempotencyKey}),replay);
-  console.log('PASS SIGKILL restart recovers ordered base/index merge, retired epoch fencing and idempotent replay');
+  console.log('PASS SIGKILL restart recovers ordered base/index merge, historical snapshot routes and idempotent replay');
 } else {
   const table = `phase2_${Date.now().toString(36)}`;
   const initial = await query(create(table));
   assert.equal(routing(initial, table).tablets.length, 1);
+  const initialSnapshot=await frontier();
   const loaded = await query(insert(table));
   const split = routing(loaded, table);
   assert.ok(split.tablets.length > 1, 'byte threshold should split tablets');
   assert.ok(split.epoch > routing(initial, table).epoch);
   assert.equal(rows(await query(`SELECT * FROM ${table}`)).length, 32);
   console.log(`PASS automatic size split: 1 -> ${split.tablets.length} tablets, epoch ${split.epoch}`);
-  const stale = await fetch(`${base}/debug/tablet`, { method:'POST', headers:{'content-type':'application/json',...auth}, body:JSON.stringify({table,tablet:routing(initial,table).tablets[0].id,epoch:routing(initial,table).epoch}) });
-  assert.equal(stale.status,409);
-  assert.equal((await stale.json()).code,'STALE_EPOCH');
-  console.log('PASS retired tablet rejects stale routing epoch');
+  const old=await query(`SELECT * FROM ${table}`,{snapshot:initialSnapshot});
+  assert.deepEqual(rows(old),[]);assert.equal(routing(old,table).tablets.length,1);
+  console.log('PASS historical snapshot retains pre-split tablet routing');
   await query(`CREATE INDEX by_tag ON ${table}(tag); CREATE UNIQUE INDEX by_email ON ${table}(email)`);
   let indexed = await query(`SELECT id FROM ${table} WHERE email = 'person17'`);
   assert.deepEqual(rows(indexed), [{ id: 17 }]);
@@ -97,32 +99,12 @@ if (mode === '--migration-seed') {
   const results = await Promise.all(writes);
   await Promise.all(reads);
   assert.ok(new Set(results.map(result => result.coordinatorId)).size > 1, 'requests should use multiple coordinators');
-  assert.ok(results.some(result => result.participants.filter(p => p.kind === 'row').length > 1), 'transfer should touch separate row tablets');
+  assert.ok(results.some(result => result.participants.filter(p => p.name.startsWith('base/')).length > 1), 'transfer should touch separate row tablets');
   console.log('PASS concurrent multi-coordinator cross-tablet writes and reads preserve transfer invariant');
-  await query(`UPDATE ${table} SET balance = balance + 500 WHERE id = 1`, { fault: 'after-lock' }, 503);
-  assert.equal(rows(await query(`SELECT balance FROM ${table} WHERE id = 1`))[0].balance, 80);
-  console.log('PASS another coordinator recovers abandoned acquired table lock');
   const merged = await query(`DELETE FROM ${table} WHERE id > 1`);
   assert.ok(routing(merged, table).tablets.length < split.tablets.length, 'small dataset should merge tablets');
   assert.equal(rows(await query(`SELECT * FROM ${table}`)).length, 1);
   assert.equal(rows(await query(`SELECT * FROM ${table} WHERE email = 'renamed'`)).length, 0);
   console.log(`PASS automatic merge after deletes: ${split.tablets.length} -> ${routing(merged, table).tablets.length} tablets; deleted index entries gone`);
-  const left = `left_${Date.now().toString(36)}`, right = `right_${Date.now().toString(36)}`;
-  await query(`CREATE TABLE ${left} (id INTEGER PRIMARY KEY, n INTEGER); CREATE TABLE ${right} (id INTEGER PRIMARY KEY, n INTEGER); INSERT INTO ${left} (id,n) VALUES (1,0); INSERT INTO ${right} (id,n) VALUES (1,0)`);
-  const leftKey = randomUUID(); let rightKey = randomUUID();
-  while(keyHash(leftKey)%4===keyHash(rightKey)%4) rightKey=randomUUID();
-  const concurrent = [query(`UPDATE ${left} SET n=n+1`,{idempotencyKey:leftKey,pauseAfterLockMs:700}),query(`UPDATE ${right} SET n=n+1`,{idempotencyKey:rightKey,pauseAfterLockMs:700})];
-  let overlap = false;
-  for(let attempt=0;attempt<100;attempt++) {
-    const response=await fetch(`${base}/debug/locks`,{method:'POST',headers:{'content-type':'application/json',...auth},body:'{}'});
-    const {locks}=await response.json();
-    if(locks[`lock:${left}`] && locks[`lock:${right}`]) {
-      assert.notEqual(locks[`lock:${left}`].owner,locks[`lock:${right}`].owner); overlap=true; break;
-    }
-    await new Promise(resolve=>setTimeout(resolve,5));
-  }
-  await Promise.all(concurrent);
-  assert.ok(overlap,'two independent coordinators must hold disjoint table grants simultaneously');
-  console.log('PASS real celld overlap: two coordinators simultaneously hold disjoint table locks');
-  console.log('8 phase-two integration tests passed');
+  console.log('6 phase-two integration tests passed');
 }

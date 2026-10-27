@@ -10,4 +10,4 @@ async function run(sql) {
 }
 await run(`CREATE TABLE ${table} (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, balance INTEGER NOT NULL); INSERT INTO ${table} (id,owner,balance) VALUES (1,'Ada',100),(2,'Grace',100)`);
 const transfer = await run(`BEGIN; UPDATE ${table} SET balance = balance - 25 WHERE id = 1; UPDATE ${table} SET balance = balance + 25 WHERE id = 2; SELECT * FROM ${table} ORDER BY id; COMMIT;`);
-console.log(`\nCommitted an atomic transfer using coordinator ${transfer.coordinatorId}; row tablets touched: ${transfer.participants.filter(p => p.kind === 'row').length}.`);
+console.log(`\nCommitted an atomic transfer using coordinator ${transfer.coordinatorId}; row tablets touched: ${transfer.participants.filter(p => p.name.startsWith('base/')).length}.`);

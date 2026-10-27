@@ -34,6 +34,7 @@ start
 node "$ROOT/scripts/integration.mjs"
 node "$ROOT/scripts/phase2-integration.mjs"
 node "$ROOT/scripts/range-integration.mjs"
+node "$ROOT/scripts/mvcc-integration.mjs"
 node "$ROOT/scripts/integration.mjs" --restart-seed "$WORK/restart.json"
 kill -KILL "$PID"
 wait "$PID" 2>/dev/null || true
@@ -58,4 +59,10 @@ wait "$PID" 2>/dev/null || true
 PID=''
 start
 node "$ROOT/scripts/phase2-integration.mjs" --merge-verify "$WORK/migration.json"
+node "$ROOT/scripts/mvcc-integration.mjs" --ready-seed "$WORK/ready.json"
+kill -KILL "$PID"
+wait "$PID" 2>/dev/null || true
+PID=''
+start
+node "$ROOT/scripts/mvcc-integration.mjs" --ready-verify "$WORK/ready.json"
 node "$ROOT/scripts/demo.mjs"

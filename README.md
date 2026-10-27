@@ -1,6 +1,6 @@
-# Murmur — ordered actor database POC
+# Murmur — ordered DataShards, MVCC and planned transactions
 
-A bounded row database on Cloudflare Workers + Durable Objects, developed with **celld**. The table layer follows YDB's **ordered typed-key ranges** and **ordered secondary-index backing tables**, not hash partitioning. This is original POC code, not a YDB port.
+A bounded Cloudflare Workers/Durable Objects row-database POC, developed with **celld**. It implements YDB-inspired ordered tables, secondary-index backing tables, shard-local transaction validation, durable coordinator intent and mediator plan/visibility tracking. It is not a YDB port or a complete YDB implementation.
 
 ## Run
 
@@ -8,66 +8,71 @@ A bounded row database on Cloudflare Workers + Durable Objects, developed with *
 npm ci
 npm run setup:celld
 npm test
-npm run test:e2e     # isolated real celld, including SIGKILL/restart recovery
-npm run dev         # 127.0.0.1:9876
+npm run test:e2e    # isolated real celld, including SIGKILL/restart recovery
+npm run dev        # 127.0.0.1:9876
 # Another terminal:
 node scripts/demo.mjs
 ```
 
-**V3 is intentionally incompatible:** start with a fresh checkout/state directory. No migration code or compatibility probes are provided. Existing `.celld/dev` data is not deleted automatically. `PORT` changes the server/test port; stop a dev server before testing on the same port. The test harness always creates its own temporary state.
+**V4 is intentionally incompatible:** use a fresh checkout/state directory. There are no version-migration or compatibility shims; existing `.celld/dev` data is not deleted automatically. The test harness uses temporary state. `PORT` changes the local server/test port; `BASE_URL` changes standalone test targets.
 
 ```sh
 curl http://127.0.0.1:9876/query -H 'Content-Type: application/json' -d '{
-  "idempotencyKey":"example-1",
+  "idempotencyKey":"setup-1",
   "sql":"CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance REAL); INSERT INTO accounts (id,balance) VALUES (-10,20.5),(2,100),(10,200); CREATE INDEX balance_idx ON accounts(balance)"
 }'
 curl http://127.0.0.1:9876/query -H 'Content-Type: application/json' -d '{
-  "idempotencyKey":"example-2",
+  "idempotencyKey":"read-1",
   "sql":"SELECT * FROM accounts WHERE id > 0 AND id <= 10 ORDER BY id"
 }'
 ```
 
-Every request is one atomic transaction. Replaying an identical `idempotencyKey`/SQL returns the original result; reusing a key with different SQL returns 409. A retryable 503 can mean an unknown outcome: retry the **same key and SQL**, without any test fault.
+Each `/query` is one transaction. Replaying an identical `idempotencyKey`, SQL and explicit snapshot returns the original result; changed input under the same key returns 409. A retryable 503 may mean an unknown outcome: retry the **same key and SQL**, without a test fault.
 
-## Ordered tables and queries
+`POST /snapshot` with `{}` returns the safe snapshot, allocated plan step, delivery frontier and unresolved plans. Read-only `/query` requests may supply `"snapshot": N` for a retained historical snapshot. `POST /recover` with `{}` helps all coordinator recovery queues. Durable alarms also recover abandoned work. Default reads do not wait for unresolved transaction holes; they see the last safe committed snapshot.
 
-- Base tablets own contiguous **`[lower, upper)` primary-key ranges**; null catalog endpoints mean unbounded. An exact split pivot belongs to the right tablet. The base SQL primary key remains single-column; index physical keys are composite tuples.
-- Typed order: numeric INTEGER/REAL values (including negative numbers and decimals), BOOLEAN false/true, and TEXT in **UTF-8 byte order**. Physical NULL sorts first. Malformed surrogate strings and nonfinite numbers are rejected; signed zero is canonicalized.
-- Physical row keys are sortable encodings, **not hashes**: transformed IEEE-754 numbers, escaped UTF-8 bytes, boolean/null tags, and concatenated typed tuple components. Bounded `storage.list(start,end)` reads only qualifying physical keys. Encoded physical keys are capped at 1,800 bytes; arbitrary non-key TEXT retains its separate character limit.
-- Single-statement SELECT bounds `=`, `>`, `>=`, `<`, `<=`, including bounded AND intersections, prune both tablets and local storage scans. Contradictory bounds perform no row reads. Other predicates are residual filters. `plan` exposes primary/index ranges, visited/total tablets and physical rows read; LIMIT is applied after the bounded scan.
-- Size-triggered splits choose an **actual row-key boundary**, balancing estimated UTF-8 serialized row bytes. Adjacent small ranges can merge regardless of their split ancestry. Defaults: split above 4,096 bytes; merge at/below 1,024. Max16 tablets/backing table; one oversized row remains unsplit. Routing, destination rows and source retirement share one durable transaction, with epoch fences rejecting stale routes.
+## One DataShard implementation
 
-## Global secondary indexes
+**Base tables and secondary indexes use the same `DataShard` class and `SHARDS` binding.** They differ only in table/partition identity and row schema. Catalog records also use versioned DataShard rows; the other actors are four transaction `Coordinator`s and one `Mediator`. There is no whole-table lock-manager actor.
 
-`CREATE [UNIQUE] INDEX name ON table(column)` creates an ordered backing table whose physical key is **(indexed value, base primary key)**. If the indexed column is already the base PK, the duplicate key component is omitted, as in YDB. Index tablets have their own ordered range map and split/merge independently; there are no fixed hash buckets.
+DataShards append `(typed key, plan step) → row/tombstone` versions and version routing metadata. A snapshot selects the latest version at or below its step. Delete tombstones, previous rows and retired tablets are retained, so historical reads survive updates, splits and merges. Ordinary commits persist **only changed base/index rows**, not replacement tablet snapshots.
 
-Index equality is a prefix range covering **every primary-key suffix**, even when duplicate indexed values span several tablets. Index inequalities use typed prefix bounds. Matching index entries lead to base-row point reads batched into at most one actor request per base tablet. NULL entries are stored in physical order, but SQL comparisons with NULL never match; uniqueness allows repeated NULL. Base rows, indexes, index-build metadata and tablet topology commit atomically. Uniqueness is checked per SQL statement, not deferred until transaction end.
+## Transaction flow
 
-## Actors and transaction safety
+1. A coordinator obtains the mediator's contiguous fully-applied snapshot frontier and executes on that snapshot, with read-your-writes inside the transaction. It records logical point/range dependencies, including empty predicates, unique-index value prefixes and base-row dependencies of index lookups.
+2. Every involved DataShard—including read-only validation participants—atomically checks for newer versions, **including applied versions above the visible frontier**, and conflicting prepared reservations. Shared read ranges and exclusive changed keys are reserved; conflicts abort/retry immediately, never wait on a tablet-wide lock. Disjoint keys on the **same table and same DataShard** can prepare concurrently.
+3. Each shard persists its delta and vote. Once every vote succeeds, the coordinator persists **COMMIT_READY** with the immutable participant/vote manifest. This is irrevocable. Before it, recovery aborts; after it, recovery must finish planning and applying.
+4. The mediator idempotently assigns a durable ordered plan step. It does no conflict certification and never waits for remote transaction execution inside its serialized handler. Shards verify the plan certificate, acknowledge delivery, atomically append MVCC deltas and acknowledge application.
+5. Delivery and application are separate watermarks. The **visible frontier advances only across a contiguous prefix of fully-applied plans**. A later independent plan may apply behind an earlier hole without exposing partial state. A successful write response waits until its step is visible, preserving subsequent default-read visibility.
 
-A per-table catalog actor publishes ordered base/index maps. Row and index tablets own durable rows, prepared changes and epochs. Four coordinator actors route requests by idempotency key; hashing is used **only to select a coordinator**, never to partition data.
+Abort markers fence delayed prepare messages; immutable votes/plans and applied markers make retries idempotent. Reservation conflicts identify their owners, allowing another coordinator to recover abandoned work even without an alarm. Coordinator recovery runs through that coordinator's queue rather than racing a live transaction.
 
-A durable lock-manager atomically grants all touched-table locks and a global fencing version. Disjoint tables genuinely execute concurrently; the same table serializes. Coordinators record acquisition intent before acquiring locks, prepare all participants, persist COMMIT before commit RPCs, then hold locks through every acknowledgment. Recovery aborts before COMMIT and completes afterward. Durable abort/release tombstones prevent late messages from resurrecting work. Reads recover outstanding owners before observing base/index/routing state.
+**Isolation:** default transactions are serializable under this bounded protocol. Snapshot validation plus retained predicate reservations prevents lost updates, write skew and phantoms; all participants prepare before any reservation is released. Common-step publication makes base/index/catalog changes atomically visible. A write returns 200 only after its publication frontier passes. Explicit historical snapshots intentionally read older committed state.
 
-This is strict table locking plus durable 2PC, **not YDB's full coordinator/mediator planning, MVCC, Calvin-style scheduling or replicated tablet storage**. Local celld persistence depends on its filesystem. Recovery is demand-driven; unavailable participants block affected tables rather than expose partial commits.
+## Ordered tables and indexes
 
-## Scope and limits
+Base tablets own contiguous **`[lower, upper)` typed primary-key ranges**; null catalog endpoints mean infinity. Splits choose an actual key by estimated UTF-8 row-byte weight; any adjacent small ranges can merge. Defaults: split above 4,096 bytes, merge at/below 1,024, max16 tablets per base/index table. One oversized row remains unsplit. Topology changes use a brief exclusive schema/epoch reservation; ordinary row transactions retain shared schema reads only. Old snapshot catalog mappings and source versions remain readable after retirement.
 
-SQL: CREATE TABLE with one inline PK; CREATE INDEX; explicit-column multi-row INSERT/full-row UPSERT; SELECT; UPDATE literals/column references/numeric +/-; DELETE; AND comparisons, single-column ORDER BY, LIMIT; optional same-request BEGIN/COMMIT. Types INTEGER (safe JS integer), REAL (finite), TEXT, BOOLEAN, nullable unless NOT NULL. No joins, aggregates, parameters, DROP/ALTER, CDC or topics.
+Physical keys preserve INTEGER/REAL numeric order, BOOLEAN order, NULL-first order and **UTF-8 byte TEXT order**. Signed zero is canonicalized; nonfinite numbers and malformed surrogate text are rejected. Encoded physical keys are limited to 1,800 bytes. Single-statement SELECT `=`, `>`, `>=`, `<`, `<=` and bounded AND prune both tablet routing and local version-key scans. Contradictory ranges issue no data reads. Plans report visited tablets, visible rows and physical versions inspected.
 
-The POC still snapshots full **touched tables for mutations and multi-statement requests**. Efficient range reads currently apply to single-statement SELECT. Limits: 32 statements, 8 touched tables, 2,000 rows across touched tables, 64 participants, 64 KiB body, 32,768 SQL characters, 100 KB durable transaction envelope. History/tombstones/retired metadata have no GC. The lock-manager and coarse locks limit throughput. This is not production-ready.
+`CREATE [UNIQUE] INDEX name ON table(column)` creates an ordered backing table keyed by **(indexed value, base PK)**; the duplicate PK component is omitted when indexing the PK itself. Indexes have independent ordered tablet maps. Prefix bounds span every PK suffix, including duplicate indexed values split across tablets. Index-to-base point reads are batched by base tablet. NULL entries are stored, but SQL NULL comparisons do not match; uniqueness permits repeated NULL. Index changes, builds and topology changes share the transaction outcome with base rows.
 
-Public access requires an `API_TOKEN` secret and bearer authorization. Keep `ALLOW_FAULTS=false` outside tests; pauses, faults and debug routes are test-only. Nothing is deployed by these commands.
+## Deliberate simplifications and bounds
 
-## YDB source mapping and verification
+This is **coordinator-assisted prepare/vote → plan/apply**, not YDB's complete peer ReadSet exchange, distributed dependency graph, multiple mediators, speculative execution or replicated tablet storage. The global resolved-prefix frontier is conservative: unrelated holes delay publication of later writes. It is not the same thing as YDB's plan-delivery barrier.
 
-Reference revision `533b58f85b1f332e14088d9c5a597d6e9c6dd18d`:
-- `schemeshard_schema.h`: partition range endpoints → catalog tablet boundaries.
-- `schemeshard__operation_split_merge.cpp`: typed ordered pivots and consecutive-range merges → ordered split/merge planner.
-- `scheme_board/cache.cpp::FillRangePartitioning`: range-border intersection → query tablet pruning.
-- `core/base/table_index.cpp::CalcTableImplDescription`: index columns followed by nonduplicate base PK columns → composite backing keys.
-- `scheme_tablecell.h` / `scheme_borders.h`: typed comparisons, NULL-first ordering and prefix bounds → shared comparator and bounded scans.
+Mutations still materialize full touched-table snapshots for local SQL evaluation/sizing, but their **logical validation footprints are predicate/key scoped and persistence is incremental**. Same-table point writers are not serialized by a hidden full-table reservation. Single-statement SELECT uses physical ordered range access. No MVCC/history/receipt/tombstone GC is implemented.
 
-Verified: **51 unit/protocol tests**, **27 actual celld HTTP checks**, and **four SIGKILL/restart scenarios** (including ordered split and merge of base/index tablets). Wrangler dry-run bundles all five actor classes; no deployment was performed.
+SQL: single-column inline base PK; CREATE TABLE/INDEX; explicit-column multi-row INSERT/full-row UPSERT; SELECT; UPDATE literals/column references/numeric +/-; DELETE; AND comparisons, one ORDER BY column, LIMIT, same-request BEGIN/COMMIT. Types INTEGER (safe JS integer), REAL, TEXT, BOOLEAN. No joins, aggregates, parameters, DROP/ALTER, CDC or topics.
 
-Tests cover numeric/UTF-8/boolean ordering, pivot inclusivity, physical scan pruning, duplicate index prefixes spanning tablets, unique conflicts, concurrency, split/merge and SIGKILL/restart recovery. Storage-double tests complement actual celld execution; they do not replace it.
+Limits: 32 statements, 8 touched tables, 2,000 touched rows, 64 participants, 64 reservations per shard, 64 KiB body, 32,768 SQL characters and 100 KB coordinator transaction envelope. No production replication, consensus, backup or availability claim is made. Local durability is only as strong as celld's filesystem.
+
+Public access requires `API_TOKEN` and bearer authorization. Keep `ALLOW_FAULTS=false` outside tests; fault/pause/debug controls are gated. No command here deploys infrastructure.
+
+## YDB mapping and tests
+
+Reference revision `533b58f85b1f332e14088d9c5a597d6e9c6dd18d`: SchemeShard typed partition endpoints and split/merge; `scheme_board/cache.cpp::FillRangePartitioning`; `table_index.cpp::CalcTableImplDescription`; typed cells/prefix borders; DataShard persistent lock validation and versioned reads; coordinator persistent plan manifests and mediator delivery acknowledgments. The role mappings above distinguish implemented behavior from the omitted YDB machinery.
+
+Verified: **63 unit/protocol tests**, **34 actual celld HTTP cases**, **five SIGKILL/restart scenarios**, and a successful Wrangler dry-run of all three actor bindings. No deployment was performed.
+
+Tests include physical range pruning and typed ordering; simultaneous same-table disjoint transactions; write-skew, empty-range phantom and unique races; invisible-version conflicts; old base/index snapshots and routing; lost plan/apply acknowledgments; alarm-only recovery; and real SIGKILL/restart at prepare, COMMIT_READY, partial apply, split and merge. Storage-double tests supplement, not replace, actual celld execution.
