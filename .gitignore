@@ -1,0 +1,8 @@
+node_modules/
+.celld/
+.tools/
+.env
+*.log
+
+.dev.vars
+.dev.vars.*
