@@ -44,3 +44,21 @@ test('unique index build rejects existing duplicates, ordinary index permits the
  assert.deepEqual(x.catalog.a.indexes,[]);
  assert.equal(run('CREATE INDEX label_nonunique ON a(label)',x.catalog,x.tables).catalog.a.indexes.length,1);
 });
+test('range predicates and ORDER BY use numeric rather than encoded lexical ordering',()=>{
+ const x=run('CREATE TABLE n (id REAL PRIMARY KEY); INSERT INTO n (id) VALUES (-10),(-2.5),(0),(2),(10); SELECT * FROM n WHERE id>=-2.5 AND id<10 ORDER BY id DESC');
+ assert.deepEqual(x.results.at(-1).rows,[{id:2},{id:0},{id:-2.5}]);
+});
+test('TEXT uses UTF-8 byte ordering including astral versus BMP private-use characters',()=>{
+ const x=run("CREATE TABLE textkeys (id TEXT PRIMARY KEY); INSERT INTO textkeys (id) VALUES ('😀'),('\uE000'),('a'); SELECT * FROM textkeys ORDER BY id; SELECT * FROM textkeys WHERE id > '\uE000' ORDER BY id");
+ assert.deepEqual(x.results.at(-2).rows.map(r=>r.id),['a','\uE000','😀']);
+ assert.deepEqual(x.results.at(-1).rows,[{id:'😀'}]);
+});
+test('reject unpaired UTF-16 surrogates in data, filters and updates even with no matching rows',()=>{
+ const x=run('CREATE TABLE a (id INTEGER PRIMARY KEY, text TEXT)');
+ for (const invalid of ['\uD800','\uDC00','\uD800x','x\uDC00','\uD800\uD800']) {
+   for (const sql of [`INSERT INTO a (id,text) VALUES (1,'${invalid}')`,`SELECT * FROM a WHERE text='${invalid}'`,`UPDATE a SET text='${invalid}' WHERE id=999`]) {
+     assert.throws(()=>run(sql,structuredClone(x.catalog),structuredClone(x.tables)),/well-formed UTF-16/);
+   }
+ }
+ assert.equal(run("INSERT INTO a (id,text) VALUES (1,'😀')",x.catalog,x.tables).tables.a[0].text,'😀');
+});

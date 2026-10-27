@@ -1,14 +1,13 @@
 import { parse, execute } from './sql.js';
-import { keyHash, routeTablet, planTablets } from './tablets.js';
+import { keyHash, routeTablet, planTablets, selectTablets } from './tablets.js';
+import { encodeKey, rangeForFilters, storageRange } from './keys.js';
 
 const json = (body, status = 200) => Response.json(body, { status });
 const bytes = value => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 const copy = value => structuredClone(value);
 export const shardFor = (key, count = 4) => keyHash(key) % count;
-async function rowKey(key) {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(key)));
-  return 'row:' + Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
-}
+const rowKey = key => 'row:' + encodeKey(key);
+const keyOf = (row, schema) => schema.keyColumns ? schema.keyColumns.map(column => row[column]) : row[schema.primaryKey];
 export async function actorCall(namespace, name, body) {
   const response = await namespace.get(namespace.idFromName(name)).fetch('https://actor/internal', {
     method: 'POST', body: JSON.stringify(body), headers: { 'content-type': 'application/json' }
@@ -80,9 +79,9 @@ class Participant extends SerialActor {
     await txn.put('data', { id: pending.id, version: pending.version, epoch: pending.epoch, retired: pending.retired, value: pending.value });
   }
   async handle(input) {
-    if (input.op === 'read' || input.op === 'get') return this.read(input);
+    if (input.op === 'read' || input.op === 'get' || input.op === 'getMany' || input.op === 'scan') return this.read(input);
     if (input.op === 'prepare') {
-      const value = await this.encode(input.value, input.primaryKey);
+      const value = await this.encode(input.value, input.primaryKey, input.keyColumns);
       const pending = { id: input.id, version: input.version, value, epoch: input.epoch, retired: !!input.retired };
       if (bytes(pending) > 110000) throw new Error('Prepared participant exceeds 110 KB');
       await this.storage.transaction(async txn => {
@@ -122,13 +121,18 @@ class Participant extends SerialActor {
 }
 export class Catalog extends Participant {}
 export class RowShard extends Participant {
-  async encode(rows, primaryKey) { return Promise.all(rows.map(async row => ({ key: await rowKey(row[primaryKey]), row }))); }
+  async encode(rows, primaryKey, keyColumns) { return rows.map(row => ({ key: rowKey(keyOf(row, { primaryKey, keyColumns })), row })); }
   async read(input) {
     const data = await this.storage.get('data');
     if (input.epoch !== undefined && (input.epoch !== this.epoch(data) || data?.retired)) return json({ error: 'Stale tablet routing epoch', code: 'STALE_EPOCH' }, 409);
-    if (input.op === 'get') return json({ row: await this.storage.get(await rowKey(input.key)) || null });
-    const rows = await this.storage.list({ prefix: 'row:' });
-    return json({ version: data?.version || 0, epoch: this.epoch(data), retired: !!data?.retired, value: [...rows.values()] });
+    if (input.op === 'get') return json({ row: await this.storage.get(rowKey(input.key)) || null });
+    if (input.op === 'getMany') {
+      if (!Array.isArray(input.keys) || input.keys.length > 2000) return json({ error: 'At most 2000 point keys per tablet request' }, 400);
+      const rows = await Promise.all(input.keys.map(key => this.storage.get(rowKey(key))));
+      return json({ rows: rows.filter(Boolean), rowsRead: input.keys.length });
+    }
+    const rows = input.range?.empty ? new Map() : await this.storage.list(input.op === 'scan' ? storageRange(input.range) : { prefix: 'row:' });
+    return json({ version: data?.version || 0, epoch: this.epoch(data), retired: !!data?.retired, value: [...rows.values()], rowsRead: rows.size });
   }
   async write(txn, pending) {
     const existing = await txn.list({ prefix: 'row:' });
@@ -143,15 +147,7 @@ export class IndexShard extends RowShard {}
 const rowName = (table, tablet) => `${table}/${tablet}`;
 const indexName = (table, index, shard) => `${table}/${index}/${shard}`;
 function indexRows(rows, schema, index) {
-  const buckets = new Map();
-  for (const row of rows) {
-    const value = row[index.column];
-    if (value === null) continue;
-    const key = JSON.stringify(value);
-    if (!buckets.has(key)) buckets.set(key, { id: value, pks: [] });
-    buckets.get(key).pks.push(row[schema.primaryKey]);
-  }
-  return [...buckets.values()];
+  return rows.map(row => ({ value: row[index.column], pk: row[schema.primaryKey] }));
 }
 
 export class Coordinator extends SerialActor {
@@ -170,12 +166,6 @@ export class Coordinator extends SerialActor {
     await this.storage.delete('active');
   }
   async handle(input) {
-    if (input.op === 'legacyInspect') {
-      const active = await this.storage.get('active');
-      const version = await this.storage.get('version');
-      const receipts = await this.storage.list({ prefix: 'request:', limit: 1 });
-      return json({ legacy: !!active || !!version || receipts.size > 0 });
-    }
     await this.recover();
     if (input.op === 'recover') return json({ recovered: true });
     const { sql, idempotencyKey: key, coordinatorId } = input;
@@ -183,11 +173,6 @@ export class Coordinator extends SerialActor {
     if (previous) return previous.sql === sql ? json(previous.response) : json({ error: 'Idempotency key reused for different SQL' }, 409);
     let statements;
     try { statements = parse(sql); } catch (e) { return json({ error: e.message }, 400); }
-    // V1's singleton catalog is never silently ignored. Upgrade must use a fresh
-    // state directory or an explicit future export/import; no destructive migration.
-    const legacy = await actorCall(this.env.CATALOG, 'catalog', { op: 'read' });
-    const legacyCoordinator = await actorCall(this.env.COORDINATOR, 'global', { op: 'legacyInspect' });
-    if ((legacy.value && Object.keys(legacy.value).length) || legacyCoordinator.legacy) return json({ error: 'V1 database detected: export/import into a new V2 state directory is required; existing data is untouched', code: 'LEGACY_STATE' }, 409);
     const tableNames = [...new Set(statements.map(s => s.table))].sort();
     if (tableNames.length > 8) return json({ error: 'At most 8 tables per transaction' }, 400);
     const active = { id: crypto.randomUUID(), key, sql, owner: coordinatorId, targets: [], decision: 'acquiring' };
@@ -215,47 +200,84 @@ export class Coordinator extends SerialActor {
       const data = await actorCall(this.env.CATALOG, `table:${table}`, { op: 'read' });
       if (data.value) catalog[table] = data.value;
     }
-    let plan = { type: 'scan' };
+    let plan = { type: 'scan', tabletsVisited: 0, rowsRead: 0 };
     const select = statements.length === 1 && statements[0].kind === 'select' ? statements[0] : null;
     const schema = select && catalog[select.table];
-    const index = schema?.indexes?.find(index => select.filter.some(f => f.column === index.column && f.op === '=' && f.value !== null));
-    if (index) {
-      const value = select.filter.find(f => f.column === index.column && f.op === '=').value;
-      const hit = await actorCall(this.env.INDEXES, indexName(select.table, index.name, shardFor(value)), { op: 'get', key: value, epoch: schema.epoch });
-      const pks = hit.row?.pks || [];
-      tables[select.table] = (await Promise.all(pks.map(pk => actorCall(this.env.ROWS, rowName(select.table, routeTablet(schema, pk)), { op: 'get', key: pk, epoch: schema.epoch })))).map(r => r.row).filter(Boolean);
-      plan = { type: 'index', index: index.name, rowsFetched: tables[select.table].length, indexShard: shardFor(value) };
+    const bounded = column => select.filter.some(f => f.column === column && ['=', '<', '<=', '>', '>='].includes(f.op));
+    if (schema) {
+      // Validate projection and all predicate types even for an empty/pruned range.
+      execute(statements, copy(catalog), { [select.table]: [] });
+      const primaryBound = bounded(schema.primaryKey);
+      const index = !primaryBound && schema.indexes?.find(index => bounded(index.column));
+      if (index) {
+        const range = rangeForFilters(select.filter, index.column, { compositePrefix: true });
+        const selected = selectTablets(index, range);
+        const parts = await Promise.all(selected.map(tablet => actorCall(this.env.INDEXES, indexName(select.table, index.name, tablet.id), { op: 'scan', range, epoch: index.epoch })));
+        const entries = parts.flatMap(part => part.value);
+        // Batch the index-to-base point lookups by tablet: bounded actor fanout,
+        // without reading unrelated keys or pretending a full scan is a lookup.
+        const baseTablets = new Map();
+        for (const entry of entries) {
+          const tablet = routeTablet(schema, entry.pk);
+          if (!baseTablets.has(tablet)) baseTablets.set(tablet, []);
+          baseTablets.get(tablet).push(entry.pk);
+        }
+        const baseParts = await Promise.all([...baseTablets].map(([tablet, keys]) => actorCall(this.env.ROWS, rowName(select.table, tablet), { op: 'getMany', keys, epoch: schema.epoch })));
+        tables[select.table] = baseParts.flatMap(part => part.rows);
+        plan = { type: 'index-range', index: index.name, indexTabletsVisited: selected.length, indexTabletsTotal: index.tablets.length, tabletsVisited: selected.length, tabletsTotal: index.tablets.length, baseTabletsVisited: baseTablets.size, rowsRead: entries.length, rowsFetched: tables[select.table].length };
+      } else {
+        const range = rangeForFilters(select.filter, schema.primaryKey);
+        const selected = selectTablets(schema, range);
+        const parts = await Promise.all(selected.map(tablet => actorCall(this.env.ROWS, rowName(select.table, tablet.id), { op: 'scan', range, epoch: schema.epoch })));
+        tables[select.table] = parts.flatMap(part => part.value);
+        plan = { type: primaryBound ? 'primary-range' : 'scan', tabletsVisited: selected.length, tabletsTotal: schema.tablets.length, rowsRead: tables[select.table].length, rowsFetched: tables[select.table].length };
+      }
     } else {
       for (const [table, schema] of Object.entries(catalog)) {
         const parts = await Promise.all(schema.tablets.map(tablet => actorCall(this.env.ROWS, rowName(table, tablet.id), { op: 'read', epoch: schema.epoch })));
         tables[table] = parts.flatMap(part => part.value || []);
+        plan.tabletsVisited += parts.length; plan.rowsRead += tables[table].length;
       }
     }
     const result = execute(statements, copy(catalog), copy(tables));
     if (Object.values(result.tables).reduce((n, rows) => n + rows.length, 0) > 2000) throw new Error('POC limit: 2000 rows per transaction');
     const targets = [], events = [];
     const writes = new Set(statements.filter(s => s.kind !== 'select').map(s => s.table));
+    const sizing = { splitBytes: Number(this.env.TABLET_SPLIT_BYTES || 4096), mergeBytes: Number(this.env.TABLET_MERGE_BYTES || 1024) };
+    const addTablets = (table, kind, old, next, partitions, nameOf) => {
+      for (const part of partitions) {
+        const existing = old?.tablets?.some(t => t.id === part.id);
+        targets.push({ kind, name: nameOf(part.id), value: part.rows, primaryKey: next.primaryKey, keyColumns: next.keyColumns, epoch: next.epoch, expectedEpoch: existing ? old.epoch : 0 });
+      }
+      for (const retired of old?.tablets || []) if (!next.tablets.some(t => t.id === retired.id)) targets.push({ kind, name: nameOf(retired.id), value: [], primaryKey: next.primaryKey, keyColumns: next.keyColumns, epoch: next.epoch, expectedEpoch: old.epoch, retired: true });
+    };
     for (const table of writes) {
       const old = catalog[table];
       const current = result.catalog[table];
-      const planned = planTablets(current, result.tables[table], { splitBytes: Number(this.env.TABLET_SPLIT_BYTES || 4096), mergeBytes: Number(this.env.TABLET_MERGE_BYTES || 1024) });
-      result.catalog[table] = planned.schema;
+      for (const row of result.tables[table]) encodeKey(row[current.primaryKey]);
+      const planned = planTablets(current, result.tables[table], sizing);
       const next = planned.schema;
       events.push(...planned.events.map(event => ({ table, ...event })));
-      if (JSON.stringify(old) !== JSON.stringify(next)) targets.push({ kind: 'catalog', name: `table:${table}`, value: next, expectedEpoch: old?.epoch || 0, epoch: next.epoch });
-      for (const part of planned.partitions) {
-        const existing = old?.tablets?.some(t => t.id === part.id);
-        targets.push({ kind: 'row', name: rowName(table, part.id), value: part.rows, primaryKey: next.primaryKey, epoch: next.epoch, expectedEpoch: existing ? old.epoch : 0 });
-      }
-      for (const retired of old?.tablets || []) if (!next.tablets.some(t => t.id === retired.id)) targets.push({ kind: 'row', name: rowName(table, retired.id), value: [], primaryKey: next.primaryKey, epoch: next.epoch, expectedEpoch: old.epoch, retired: true });
+      addTablets(table, 'row', old, next, planned.partitions, id => rowName(table, id));
+      const indexes = [];
       for (const index of next.indexes || []) {
-        const buckets = indexRows(result.tables[table], next, index);
-        const exists = old?.indexes?.some(i => i.name === index.name);
-        for (let shard = 0; shard < 4; shard++) targets.push({ kind: 'index', name: indexName(table, index.name, shard), value: buckets.filter(bucket => shardFor(bucket.id) === shard), primaryKey: 'id', epoch: next.epoch, expectedEpoch: exists ? old.epoch : 0 });
+        const entries = indexRows(result.tables[table], next, index);
+        const indexSchema = { ...index, keyColumns: index.column === next.primaryKey ? ['value'] : ['value', 'pk'] };
+        for (const entry of entries) encodeKey(keyOf(entry, indexSchema));
+        const indexed = planTablets(indexSchema, entries, sizing);
+        indexes.push(indexed.schema);
+        const previous = old?.indexes?.find(i => i.name === index.name);
+        events.push(...indexed.events.map(event => ({ table, index: index.name, ...event })));
+        addTablets(table, 'index', previous, indexed.schema, indexed.partitions, id => indexName(table, index.name, id));
       }
+      next.indexes = indexes;
+      result.catalog[table] = next;
+      // Put catalog first in the decision's participant list to exercise safe
+      // publication-before-data recovery: locks prevent any mixed observation.
+      if (JSON.stringify(old) !== JSON.stringify(next)) targets.unshift({ kind: 'catalog', name: `table:${table}`, value: next, expectedEpoch: old?.epoch || 0, epoch: next.epoch });
     }
     if (targets.length > 64) throw new Error('At most 64 participants per transaction');
-    const response = { transactionId: active.id, version: active.version, coordinatorId: active.owner, results: result.results, participants: targets.map(({ kind, name }) => ({ kind, name })), routing: Object.entries(result.catalog).map(([table, schema]) => ({ table, epoch: schema.epoch, tablets: schema.tablets })), events, plan };
+    const response = { transactionId: active.id, version: active.version, coordinatorId: active.owner, results: result.results, participants: targets.map(({ kind, name }) => ({ kind, name })), routing: Object.entries(result.catalog).map(([table, schema]) => ({ table, epoch: schema.epoch, tablets: schema.tablets, indexes: (schema.indexes || []).map(index => ({ name: index.name, keyColumns: index.keyColumns, epoch: index.epoch, tablets: index.tablets })) })), events, plan };
     Object.assign(active, { targets, response, decision: 'preparing' });
     if (bytes(active) > 100000) { active.decision = 'acquiring'; throw new Error('POC transaction snapshot/result limit exceeded (100 KB)'); }
     await this.storage.put('active', active);
@@ -292,7 +314,7 @@ async function readBody(request) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname === '/health' && request.method === 'GET') return json({ ok: true, engine: 'actor-row-db-v2', coordinators: 4 });
+    if (url.pathname === '/health' && request.method === 'GET') return json({ ok: true, engine: 'murmur-ordered-v3', coordinators: 4 });
     if (request.method !== 'POST' || !['/query', '/debug/tablet', '/debug/locks'].includes(url.pathname)) return json({ error: 'POST /query or GET /health' }, 404);
     if (env.API_TOKEN && request.headers.get('authorization') !== `Bearer ${env.API_TOKEN}`) return json({ error: 'Unauthorized' }, 401);
     if (!env.API_TOKEN && !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)) return json({ error: 'Set API_TOKEN for non-loopback access' }, 403);

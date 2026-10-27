@@ -8,8 +8,7 @@
     "test:integration": "node scripts/integration.mjs",
     "dev": "node scripts/dev.mjs",
     "setup:celld": "CELLD_VERSION=v0.6.2 CELLD_INSTALL_ROOT=\"$PWD/.tools\" sh scripts/install-celld.sh",
-    "test:e2e": "bash scripts/test-celld.sh",
-    "test:legacy": "bash scripts/test-legacy.sh"
+    "test:e2e": "bash scripts/test-celld.sh"
   },
   "engines": {
     "node": ">=20"

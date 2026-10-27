@@ -10,7 +10,7 @@ function storage() {
     get: async key => structuredClone(data.get(key)),
     put: async (key, value) => { data.set(key, structuredClone(value)); },
     delete: async key => data.delete(key),
-    list: async ({prefix = ''} = {}) => new Map([...data].filter(([k]) => k.startsWith(prefix)).sort().map(([k,v])=>[k,structuredClone(v)])),
+    list: async ({prefix = '',start,end,limit,reverse=false} = {}) => { let values=[...data].filter(([k])=>k.startsWith(prefix)&&(start===undefined||k>=start)&&(end===undefined||k<end)).sort(([a],[b])=>a<b?-1:a>b?1:0); if(reverse)values.reverse();if(limit!==undefined)values=values.slice(0,limit);return new Map(values.map(([k,v])=>[k,structuredClone(v)])); },
     transaction: async fn => {
       const backup = structuredClone(data);
       try { return await fn(api); }
@@ -57,7 +57,7 @@ test('participant commit replay cannot revert newer rows; deleted row keys disap
     assert.equal((await invoke(actor,{op:'commit',id,version})).status,200);
   }
   assert.equal((await invoke(actor,{op:'commit',id:'a',version:1})).status,200);
-  assert.deepEqual((await invoke(actor,{op:'read'})).body,{version:2,epoch:1,retired:false,value:[{id:2}]});
+  assert.deepEqual((await invoke(actor,{op:'read'})).body,{version:2,epoch:1,retired:false,value:[{id:2}],rowsRead:1});
 });
 for (const fault of ['after-prepare','after-decision','after-first-commit']) test(`coordinator reset ${fault}: recovery precedes read, replay exactly once`,async()=>{
   const db=cluster();
@@ -123,15 +123,4 @@ test('retired tablets reject stale reads and preparations',async()=>{
   assert.equal((await invoke(actor,{op:'read',epoch:1})).status,409);
   assert.equal((await invoke(actor,{op:'read',epoch:2})).status,409);
   assert.equal((await invoke(actor,{op:'prepare',id:'c',version:3,primaryKey:'id',epoch:3,expectedEpoch:2,value:[{id:2}]})).body.code,'STALE_EPOCH');
-});
-test('nonempty V1 catalog fails closed without erasing old state',async()=>{
-  const db=cluster();
-  const legacy=db.env.CATALOG.get('catalog');
-  const old={accounts:{columns:[{name:'id',type:'INTEGER',primaryKey:true}],primaryKey:'id',shards:4}};
-  const call=async body=>legacy.fetch('https://actor/internal',{method:'POST',body:JSON.stringify(body)});
-  assert.equal((await call({op:'prepare',id:'v1',version:1,epoch:1,expectedEpoch:0,value:old})).status,200);
-  assert.equal((await call({op:'commit',id:'v1',version:1})).status,200);
-  const result=await db.query('SELECT * FROM accounts');
-  assert.equal(result.status,409);assert.equal(result.body.code,'LEGACY_STATE');
-  assert.deepEqual((await (await call({op:'read'})).json()).value,old);
 });

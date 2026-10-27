@@ -6,7 +6,7 @@ import Worker, {Coordinator, Catalog, RowShard, IndexShard, LockManager, shardFo
 const clone = structuredClone;
 function storage() {
   const data = new Map();
-  const api = {get:async k=>clone(data.get(k)),put:async(k,v)=>data.set(k,clone(v)),delete:async k=>data.delete(k),list:async({prefix='' }={})=>new Map([...data].filter(([k])=>k.startsWith(prefix)).map(([k,v])=>[k,clone(v)]))};
+  const api = {get:async k=>clone(data.get(k)),put:async(k,v)=>data.set(k,clone(v)),delete:async k=>data.delete(k),list:async({prefix='',start,end,limit}={})=>new Map([...data].filter(([k])=>k.startsWith(prefix)&&(start===undefined||k>=start)&&(end===undefined||k<end)).sort(([a],[b])=>a<b?-1:a>b?1:0).slice(0,limit).map(([k,v])=>[k,clone(v)]))};
   api.transaction=async fn=>{ const saved=clone(data); try{return await fn(api);}catch(e){data.clear();for(const [k,v]of saved)data.set(k,v);throw e;} };
   return api;
 }
@@ -50,7 +50,7 @@ test('a paused transaction cannot block disjoint table work on another coordinat
 test('partial index/base commit is recovered before a different coordinator observes either',async()=>{
  const db=cluster();assert.equal((await db.query("CREATE TABLE a (id INTEGER PRIMARY KEY, tag TEXT); INSERT INTO a (id,tag) VALUES (1,'old'); CREATE UNIQUE INDEX tag_idx ON a (tag)")).status,200);
  const changed=await db.query("UPDATE a SET tag='new'",ownerKeys[0],{fault:'after-first-commit'});assert.equal(changed.status,503);
- const indexed=await db.query("SELECT * FROM a WHERE tag='new'",ownerKeys[1]);assert.equal(indexed.status,200);assert.equal(indexed.plan.type,'index');assert.deepEqual(rows(indexed),[{id:1,tag:'new'}]);
+ const indexed=await db.query("SELECT * FROM a WHERE tag='new'",ownerKeys[1]);assert.equal(indexed.status,200);assert.equal(indexed.plan.type,'index-range');assert.deepEqual(rows(indexed),[{id:1,tag:'new'}]);
  assert.deepEqual(rows(await db.query("SELECT * FROM a WHERE tag='old'",ownerKeys[2])),[]);
  assert.equal((await db.query("INSERT INTO a (id,tag) VALUES (2,'new')",ownerKeys[3])).status,400);
  assert.deepEqual(rows(await db.query('SELECT * FROM a')),[{id:1,tag:'new'}]);
@@ -84,7 +84,7 @@ for(const fault of ['after-prepare','after-first-commit']) test(`split+index ${f
  const read=await db.query('SELECT * FROM a',ownerKeys[1]);assert.equal(read.status,200);assert.equal(rows(read).length,fault==='after-prepare'?1:41);
  if(fault==='after-prepare')assert.equal(read.routing[0].epoch,initial.routing[0].epoch);else assert.ok(read.routing[0].epoch>initial.routing[0].epoch);
  const replay=await db.query(sql,ownerKeys[0]);assert.equal(replay.status,200);
- const indexed=await db.query(`SELECT * FROM a WHERE tag='${'x'.repeat(60)}'`,ownerKeys[2]);assert.equal(indexed.plan.type,'index');assert.equal(rows(indexed).length,40);
+ const indexed=await db.query(`SELECT * FROM a WHERE tag='${'x'.repeat(60)}'`,ownerKeys[2]);assert.equal(indexed.plan.type,'index-range');assert.equal(rows(indexed).length,40);
  assert.equal(rows(await db.query('SELECT * FROM a')).length,41);
 });
 
@@ -95,14 +95,6 @@ test('concurrent different-owner unique-index claims admit exactly one row',asyn
  const scan=rows(await db.query('SELECT * FROM a'));const lookup=rows(await db.query("SELECT * FROM a WHERE tag='same'"));assert.equal(scan.length,1);assert.deepEqual(lookup,scan);
 });
 
-
-test('legacy pending first CREATE with empty catalog fails closed and is untouched',async()=>{
- const db=cluster();const legacy={id:'v1-pending',key:'old',sql:'CREATE TABLE old (id INTEGER PRIMARY KEY)',version:1,decision:'preparing',targets:[{kind:'catalog',name:'catalog',value:{old:{columns:[{name:'id',type:'INTEGER',primaryKey:true}],primaryKey:'id',shards:4}}}]};
- const state=db.env.COORDINATOR.state('global');await state.put('active',legacy);
- const response=await db.query('CREATE TABLE fresh (id INTEGER PRIMARY KEY)');assert.equal(response.status,409);assert.equal(response.code,'LEGACY_STATE');
- assert.deepEqual(await state.get('active'),legacy);
- assert.equal(await db.env.CATALOG.state('table:fresh').get('data'),undefined);
-});
 
 test('index fast path still validates predicate types and unknown columns with no hits',async()=>{
  const db=cluster();await db.query('CREATE TABLE a (id INTEGER PRIMARY KEY, n INTEGER); CREATE INDEX n_idx ON a (n)');

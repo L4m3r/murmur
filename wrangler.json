@@ -1,5 +1,5 @@
 {
-  "name": "actor-row-db",
+  "name": "murmur-ordered-v3",
   "main": "src/index.js",
   "compatibility_date": "2026-01-01",
   "durable_objects": {
@@ -28,16 +28,11 @@
   },
   "migrations": [
     {
-      "tag": "v1",
+      "tag": "v3-initial",
       "new_sqlite_classes": [
         "Catalog",
         "RowShard",
-        "Coordinator"
-      ]
-    },
-    {
-      "tag": "v2",
-      "new_sqlite_classes": [
+        "Coordinator",
         "IndexShard",
         "LockManager"
       ]

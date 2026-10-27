@@ -30,10 +30,36 @@ if (mode === '--migration-seed') {
   assert.equal(rows(await query(`SELECT * FROM ${table}`)).length, 32);
   const indexed = await query(`SELECT * FROM ${table} WHERE email = 'person17'`);
   assert.equal(rows(indexed)[0].id, 17);
-  assert.equal(indexed.plan.type, 'index');
+  assert.equal(indexed.plan.type, 'index-range');
   assert.equal(indexed.plan.rowsFetched, 1);
   assert.deepEqual(await query(sql, { idempotencyKey }), replay);
   console.log('PASS SIGKILL restart recovers tablet migration and durable secondary index atomically');
+} else if (mode === '--merge-seed') {
+  const { table } = JSON.parse(await readFile(manifest, 'utf8'));
+  await query(`INSERT INTO ${table} (id,balance,tag,email,payload) VALUES ` + Array.from({length:32},(_,i)=>`(${i+33},100,'extra','person${i+33}','${'x'.repeat(96)}')`).join(','));
+  const previous = routing(await query(`SELECT * FROM ${table}`), table);
+  assert.ok(previous.tablets.length > 1);
+  assert.ok(previous.indexes[0].tablets.length > 1);
+  const sql = `DELETE FROM ${table} WHERE id > 1`, idempotencyKey = randomUUID();
+  await query(sql, { idempotencyKey, fault:'after-first-commit' }, 503);
+  await writeFile(manifest, JSON.stringify({table,sql,idempotencyKey,previous}));
+  console.log('PASS ordered base/index tablet merge partially committed for SIGKILL');
+} else if (mode === '--merge-verify') {
+  const {table,sql,idempotencyKey,previous}=JSON.parse(await readFile(manifest,'utf8'));
+  const replay=await query(sql,{idempotencyKey}), current=routing(replay,table);
+  assert.equal(current.tablets.length,1);
+  assert.equal(current.indexes[0].tablets.length,1);
+  assert.deepEqual(rows(await query(`SELECT id FROM ${table} ORDER BY id`)),[{id:1}]);
+  const indexed=await query(`SELECT id FROM ${table} WHERE email = 'person1'`);
+  assert.deepEqual(rows(indexed),[{id:1}]);assert.equal(indexed.plan.type,'index-range');
+  assert.equal(indexed.plan.indexTabletsTotal,1);
+  assert.deepEqual(rows(await query(`SELECT id FROM ${table} WHERE email = 'person17'`)),[]);
+  const retired=previous.tablets.find(old=>!current.tablets.some(next=>next.id===old.id));
+  assert.ok(retired);
+  const stale=await fetch(`${base}/debug/tablet`,{method:'POST',headers:{'content-type':'application/json',...auth},body:JSON.stringify({table,tablet:retired.id,epoch:previous.epoch})});
+  assert.equal(stale.status,409);assert.equal((await stale.json()).code,'STALE_EPOCH');
+  assert.deepEqual(await query(sql,{idempotencyKey}),replay);
+  console.log('PASS SIGKILL restart recovers ordered base/index merge, retired epoch fencing and idempotent replay');
 } else {
   const table = `phase2_${Date.now().toString(36)}`;
   const initial = await query(create(table));
@@ -51,11 +77,11 @@ if (mode === '--migration-seed') {
   await query(`CREATE INDEX by_tag ON ${table}(tag); CREATE UNIQUE INDEX by_email ON ${table}(email)`);
   let indexed = await query(`SELECT id FROM ${table} WHERE email = 'person17'`);
   assert.deepEqual(rows(indexed), [{ id: 17 }]);
-  assert.equal(indexed.plan.type, 'index');
+  assert.equal(indexed.plan.type, 'index-range');
   assert.equal(indexed.plan.rowsFetched, 1);
   const byTag = await query(`SELECT id FROM ${table} WHERE tag = 'odd' ORDER BY id`);
   assert.equal(rows(byTag).length, 16);
-  assert.equal(byTag.plan.type, 'index');
+  assert.equal(byTag.plan.type, 'index-range');
   console.log('PASS durable unique and nonunique secondary index query plans fetch matching rows');
   await query(`UPDATE ${table} SET email = 'renamed' WHERE id = 17`);
   assert.equal(rows(await query(`SELECT * FROM ${table} WHERE email = 'person17'`)).length, 0);
