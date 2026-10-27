@@ -2,11 +2,50 @@
   "name": "actor-row-db",
   "main": "src/index.js",
   "compatibility_date": "2026-01-01",
-  "durable_objects": { "bindings": [
-    { "name": "CATALOG", "class_name": "Catalog" },
-    { "name": "ROWS", "class_name": "RowShard" },
-    { "name": "COORDINATOR", "class_name": "Coordinator" }
-  ] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Catalog", "RowShard", "Coordinator"] }],
-  "vars": { "ALLOW_FAULTS": "false" }
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CATALOG",
+        "class_name": "Catalog"
+      },
+      {
+        "name": "ROWS",
+        "class_name": "RowShard"
+      },
+      {
+        "name": "COORDINATOR",
+        "class_name": "Coordinator"
+      },
+      {
+        "name": "INDEXES",
+        "class_name": "IndexShard"
+      },
+      {
+        "name": "LOCKS",
+        "class_name": "LockManager"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "Catalog",
+        "RowShard",
+        "Coordinator"
+      ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "IndexShard",
+        "LockManager"
+      ]
+    }
+  ],
+  "vars": {
+    "ALLOW_FAULTS": "false",
+    "TABLET_SPLIT_BYTES": "4096",
+    "TABLET_MERGE_BYTES": "1024"
+  }
 }

@@ -20,7 +20,7 @@ cleanup() {
 trap cleanup EXIT
 cp -R "$ROOT/src" "$WORK/src"
 cp "$ROOT/wrangler.json" "$WORK/wrangler.json"
-printf 'ALLOW_FAULTS=true\n' > "$WORK/.dev.vars"
+printf 'ALLOW_FAULTS=true\nTABLET_SPLIT_BYTES=1024\nTABLET_MERGE_BYTES=256\n' > "$WORK/.dev.vars"
 start() {
   "$CELLD" dev "$WORK" --host 127.0.0.1 --port "${PORT:-9876}" --no-watch > "$WORK/runtime.log" 2>&1 & PID=$!
   for _ in $(seq 1 100); do
@@ -32,6 +32,7 @@ start() {
 }
 start
 node "$ROOT/scripts/integration.mjs"
+node "$ROOT/scripts/phase2-integration.mjs"
 node "$ROOT/scripts/integration.mjs" --restart-seed "$WORK/restart.json"
 kill -KILL "$PID"
 wait "$PID" 2>/dev/null || true
@@ -44,4 +45,10 @@ wait "$PID" 2>/dev/null || true
 PID=''
 start
 node "$ROOT/scripts/integration.mjs" --abort-verify "$WORK/abort.json"
+node "$ROOT/scripts/phase2-integration.mjs" --migration-seed "$WORK/migration.json"
+kill -KILL "$PID"
+wait "$PID" 2>/dev/null || true
+PID=''
+start
+node "$ROOT/scripts/phase2-integration.mjs" --migration-verify "$WORK/migration.json"
 node "$ROOT/scripts/demo.mjs"

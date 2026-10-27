@@ -37,6 +37,11 @@ export function parse(sql) {
     if (take('commit')) { if (!wrapper || committed) throw new Error('Unexpected COMMIT'); committed = true; take(';'); if (pos !== tokens.length) throw new Error('COMMIT must be last'); break; }
     let s;
     if (take('create')) {
+      const unique = take('unique');
+      if (unique || peek() === 'index') {
+        need('index'); const index = name(); need('on'); const table = name(); need('('); const column = name(); need(')');
+        s = {kind:'createIndex',table,index,column,unique};
+      } else {
       need('table'); const table = name(); need('(');
       const columns = list(() => { const column = {name:name(), type:name().toUpperCase(),primaryKey:false,notNull:false};
         if (!['INTEGER','REAL','TEXT','BOOLEAN'].includes(column.type)) throw new Error('Unsupported column type');
@@ -44,6 +49,7 @@ export function parse(sql) {
       }); need(')');
       if (new Set(columns.map(c=>c.name)).size !== columns.length || columns.filter(c=>c.primaryKey).length !== 1) throw new Error('Require unique column names and exactly one inline PRIMARY KEY');
       s = {kind:'create',table,columns};
+      }
     } else if (['insert','upsert'].includes(peek())) {
       const kind = tokens[pos++].value; need('into'); const table = name(); need('('); const columns = list(name); need(')'); need('values');
       const values = list(() => { need('('); const row = list(literal); need(')'); return row; });
@@ -76,14 +82,35 @@ export function execute(statements, catalog, tables) {
     if (!valid) throw new Error(`Invalid ${c.type} value for ${c.name}`);
     if (typeof v === 'string' && v.length > 8192) throw new Error('Text exceeds 8192 characters');
   };
+  const validateIndexes = (schema, rows) => {
+    for (const index of schema.indexes || []) {
+      if (!index.unique) continue;
+      const seen = new Set();
+      for (const row of rows) {
+        const value = row[index.column];
+        if (value === null) continue;
+        if (seen.has(value)) throw new Error(`Unique index ${index.name} violation`);
+        seen.add(value);
+      }
+    }
+  };
   for (const s of statements) {
     if (s.kind === 'create') {
       if (Object.hasOwn(catalog,s.table)) throw new Error(`Table ${s.table} exists`);
       if (Object.keys(catalog).length >= 32) throw new Error('At most 32 tables');
-      catalog[s.table] = {columns:s.columns,primaryKey:s.columns.find(c=>c.primaryKey).name,shards:4}; tables[s.table] = []; results.push({rowsAffected:0}); continue;
+      catalog[s.table] = {columns:s.columns,primaryKey:s.columns.find(c=>c.primaryKey).name,shards:4,indexes:[]}; tables[s.table] = []; results.push({rowsAffected:0}); continue;
     }
     const schema = Object.hasOwn(catalog,s.table) && catalog[s.table]; if (!schema) throw new Error(`Unknown table ${s.table}`);
     const rows = tables[s.table]; const pk = schema.primaryKey;
+    if (s.kind === 'createIndex') {
+      known(schema,s.column);
+      const indexes = schema.indexes || [];
+      if (indexes.some(index => index.name === s.index)) throw new Error(`Index ${s.index} exists`);
+      if (indexes.length >= 16) throw new Error('At most 16 indexes per table');
+      schema.indexes = [...indexes,{name:s.index,column:s.column,unique:s.unique}];
+      validateIndexes(schema,rows);
+      results.push({rowsAffected:0}); continue;
+    }
     for (const f of s.filter || []) { const c = known(schema,f.column); check({...c,notNull:false,primaryKey:false},f.value); }
     const matches = row => (s.filter || []).every(f => { const a = row[f.column], b = f.value; if (a === null || b === null) return false; switch(f.op) { case '=': return a === b; case '!=': case '<>': return a !== b; case '<': return a < b; case '>': return a > b; case '<=': return a <= b; case '>=': return a >= b; } });
     if (s.kind === 'insert' || s.kind === 'upsert') {
@@ -113,6 +140,7 @@ export function execute(statements, catalog, tables) {
       }); results.push({rowsAffected:count});
     } else if (s.kind === 'delete') { tables[s.table] = rows.filter(r=>!matches(r)); results.push({rowsAffected:rows.length-tables[s.table].length}); }
     else throw new Error('Unknown AST statement');
+    if (['insert','upsert','update'].includes(s.kind)) validateIndexes(schema,tables[s.table]);
   }
   return {catalog,tables,results};
 }
