@@ -42,3 +42,34 @@ test('index equality and inequalities span all primary-key suffixes',()=>{
  const single=rangeForFilters([{column:'value',op:'=',value:2}],'value',{compositePrefix:true});
  assert.ok(matches([2],single));assert.ok(!matches([3],single));
 });
+
+test('composite primary row keys and lexicographic prefix ranges',async()=>{
+ const {primaryColumns,keyOfRow,primaryRangeForFilters}=await import('../src/keys.js');
+ const schema={primaryKey:'tenant',primaryKeys:['tenant','id']};
+ assert.deepEqual(primaryColumns(schema),['tenant','id']);assert.deepEqual(keyOfRow(schema,{tenant:'😀',id:-2}),['😀',-2]);
+ assert.equal(keyOfRow({primaryKey:'id'},{id:3}),3);
+ const contains=(range,key)=>{const encoded=encodeKey(key);return !range.empty&&(range.lower===null||encoded>range.lower||(encoded===range.lower&&range.lowerInclusive))&&(range.upper===null||encoded<range.upper||(encoded===range.upper&&range.upperInclusive));};
+ const keys=[['a',-2],['a',0],['a',1],['a',2],['b',-10],['\uE000',1],['😀',1]];
+ const eq={column:'tenant',op:'=',value:'a'};
+ assert.deepEqual(keys.filter(k=>contains(primaryRangeForFilters(schema,[eq]),k)),keys.slice(0,4));
+ for(const [op,wanted] of [['>',[2]],['>=',[1,2]],['<',[-2,0]],['<=',[-2,0,1]],['=',[1]]]) {
+   const r=primaryRangeForFilters(schema,[eq,{column:'id',op,value:1}]);
+   assert.deepEqual(keys.filter(k=>contains(r,k)).map(k=>k[1]),wanted,op);
+ }
+ assert.deepEqual(keys.filter(k=>contains(primaryRangeForFilters(schema,[{column:'tenant',op:'>',value:'\uE000'}]),k)),[['😀',1]]);
+ const point=primaryRangeForFilters(schema,[eq,{column:'id',op:'=',value:1}]);assert.equal(point.lower,encodeKey(['a',1]));assert.equal(point.upper,point.lower);assert.equal(point.upperInclusive,true);
+ const residual=primaryRangeForFilters(schema,[{column:'id',op:'=',value:1}]);assert.equal(residual.lower,null);assert.equal(residual.upper,null);
+ assert.equal(primaryRangeForFilters(schema,[eq,{column:'tenant',op:'=',value:'b'}]).empty,true);
+ assert.equal(primaryRangeForFilters(schema,[eq,{column:'id',op:'=',value:null}]).empty,true);
+});
+
+test('three-column primary bounds exclude or include complete suffixes',async()=>{
+ const {primaryRangeForFilters}=await import('../src/keys.js');
+ const schema={primaryKeys:['a','b','c']}, eq={column:'a',op:'=',value:2};
+ for(const op of ['>','>=','<','<=']) {
+  const r=primaryRangeForFilters(schema,[eq,{column:'b',op,value:4}]);
+  const includes=key=>{const e=encodeKey(key);return(r.lower===null||e>r.lower||(e===r.lower&&r.lowerInclusive))&&(r.upper===null||e<r.upper||(e===r.upper&&r.upperInclusive));};
+  for(const b of [3,4,5])for(const c of [-100,0,100])assert.equal(includes([2,b,c]),op==='>'?b>4:op==='>='?b>=4:op==='<'?b<4:b<=4);
+  assert.equal(includes([1,100,100]),false);assert.equal(includes([3,-100,-100]),false);
+ }
+});

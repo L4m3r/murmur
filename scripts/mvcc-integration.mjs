@@ -1,3 +1,4 @@
+import { assertFaultBoundary } from './fault-proof.mjs';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile,writeFile } from 'node:fs/promises';
@@ -5,7 +6,13 @@ import { keyHash } from '../src/tablets.js';
 const base=process.env.BASE_URL||'http://127.0.0.1:9876';
 const auth=process.env.API_TOKEN?{authorization:`Bearer ${process.env.API_TOKEN}`} : {};
 async function post(path,body={}){const response=await fetch(`${base}${path}`,{method:'POST',headers:{'content-type':'application/json',...auth},body:JSON.stringify(body)});return{status:response.status,body:await response.json()};}
-async function query(sql,extra={},status=200){const result=await post('/query',{sql,idempotencyKey:randomUUID(),...extra});assert.equal(result.status,status,`${sql.slice(0,200)} ${JSON.stringify(result.body)}`);return result.body;}
+async function query(sql,extra={},status=200){
+ const payload={sql,idempotencyKey:randomUUID(),...extra},deadline=Date.now()+30000;
+ while(true){const result=await post('/query',payload);
+  if((status===200||(status===503&&extra.fault&&result.body.code==='PLAN_PENDING'))&&result.status===503&&result.body.retryable===true&&Date.now()<deadline){console.error(`${result.body.code==='PLAN_PENDING'?'PLAN_PENDING':'RETRY'} same idempotency key after retryable503: ${result.body.error}; diagnostics=${JSON.stringify({code:result.body.code,rpc:result.body.rpc,retryAfterMs:result.body.retryAfterMs})}`);await new Promise(resolve=>setTimeout(resolve,Math.min(Math.max(250,result.body.retryAfterMs||0),Math.max(0,deadline-Date.now()))));continue;}
+  assert.equal(result.status,status,`${sql.slice(0,200)} ${JSON.stringify(result.body)}`);if(status===503&&extra.fault)assertFaultBoundary(extra.fault,result.body);return result.body;
+ }
+}
 async function snapshot(){const result=await post('/snapshot');assert.equal(result.status,200);return result.body;}
 async function recover(){assert.equal((await post('/recover')).status,200);}
 const rows=result=>result.results.at(-1).rows;
@@ -31,22 +38,23 @@ if(mode==='--ready-seed'){
   const transfer=`UPDATE ${table} SET balance=balance-7 WHERE id=1; UPDATE ${table} SET balance=balance+7 WHERE id=2`;
   const transferKey=randomUUID();
   await query(transfer,{idempotencyKey:transferKey,fault:'after-first-commit'},503);
-  assert.deepEqual(rows(await query(`SELECT balance FROM ${table} ORDER BY id`,{idempotencyKey:otherKey([transferKey])})),[{balance:100},{balance:100}]);
   const hole=await snapshot();assert.ok(hole.allocated>hole.frontier);assert.equal(hole.frontier,before);
+  assert.deepEqual(rows(await query(`SELECT balance FROM ${table} ORDER BY id`,{snapshot:before,idempotencyKey:otherKey([transferKey])})),[{balance:100},{balance:100}]);
+  assert.deepEqual(rows(await query(`SELECT balance FROM ${table} ORDER BY id`,{idempotencyKey:otherKey([transferKey])})),[{balance:93},{balance:107}]);
   await recover();
   assert.deepEqual(rows(await query(`SELECT balance FROM ${table} ORDER BY id`)),[{balance:93},{balance:107}]);
   assert.deepEqual(rows(await query(`SELECT balance FROM ${table} ORDER BY id`,{snapshot:before})),[{balance:100},{balance:100}]);
-  console.log('PASS stable frontier hides partially applied versions; historical snapshot survives commit');
+  console.log('PASS relevant latest reads help partial plans atomically; explicit historical snapshot remains stable');
   const baseline=(await snapshot()).frontier;
   const leftKey=randomUUID();let rightKey=randomUUID();while(keyHash(leftKey)%4===keyHash(rightKey)%4)rightKey=randomUUID();
   const pending=[query(`UPDATE ${table} SET balance=balance+1 WHERE id=1`,{idempotencyKey:leftKey,pauseAfterPlanMs:900}),query(`UPDATE ${table} SET balance=balance+1 WHERE id=2`,{idempotencyKey:rightKey,pauseAfterPlanMs:900})];
   let overlap=false;
   for(let i=0;i<100;i++){const state=await snapshot();if(state.allocated>=baseline+2&&state.frontier===baseline){overlap=true;break;}await new Promise(resolve=>setTimeout(resolve,5));}
-  const during=await query(`SELECT balance FROM ${table} ORDER BY id`,{idempotencyKey:otherKey([leftKey,rightKey])});
+  const during=await query(`SELECT balance FROM ${table} ORDER BY id`,{snapshot:baseline,idempotencyKey:otherKey([leftKey,rightKey])});
   assert.deepEqual(rows(during),[{balance:93},{balance:107}]);
   const completed=await Promise.all(pending);assert.ok(overlap,'disjoint same-table writes must have two planned steps simultaneously');
   assert.notEqual(completed[0].coordinatorId,completed[1].coordinatorId);
-  console.log('PASS distinct coordinators plan same-table disjoint-key writes concurrently while reads keep old snapshot');
+  console.log('PASS distinct coordinators plan same-table disjoint-key writes concurrently while explicit historical reads stay stable');
   await Promise.all(Array.from({length:12},()=>query(`UPDATE ${table} SET balance=balance+1 WHERE id=1`,{pauseAfterReadMs:20})));
   assert.deepEqual(rows(await query(`SELECT balance FROM ${table} ORDER BY id`)),[{balance:106},{balance:108}]);
   console.log('PASS conflicting increments validate and retry without lost updates');

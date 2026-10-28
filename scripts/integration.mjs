@@ -1,3 +1,4 @@
+import { assertFaultBoundary } from './fault-proof.mjs';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { writeFile, readFile } from 'node:fs/promises';
@@ -6,10 +7,19 @@ const base = process.env.BASE_URL || 'http://127.0.0.1:9876';
 const auth = process.env.API_TOKEN ? { authorization: `Bearer ${process.env.API_TOKEN}` } : {};
 const key = () => randomUUID();
 async function query(sql, options = {}, status = 200) {
-  const response = await fetch(`${base}/query`, { method: 'POST', headers: { 'content-type': 'application/json', ...auth }, body: JSON.stringify({ sql, idempotencyKey: key(), ...options }) });
-  const value = await response.json();
-  assert.equal(response.status, status, `${sql}: ${JSON.stringify(value)}`);
-  return value;
+  const payload = JSON.stringify({ sql, idempotencyKey: randomUUID(), ...options });
+  const deadline = Date.now() + 30000;
+  while (true) {
+    const response = await fetch(`${base}/query`, { method:'POST', headers:{'content-type':'application/json',...auth}, body:payload });
+    const value = await response.json();
+    if ((status === 200 || (status === 503 && options.fault && value.code === 'PLAN_PENDING')) && response.status === 503 && value.retryable === true && Date.now() < deadline) {
+      console.error(`${value.code==='PLAN_PENDING'?'PLAN_PENDING':'RETRY'} same idempotency key after retryable503: ${value.error}; diagnostics=${JSON.stringify({code:value.code,rpc:value.rpc,retryAfterMs:value.retryAfterMs})}`);
+      await new Promise(resolve => setTimeout(resolve,Math.min(Math.max(250,value.retryAfterMs||0),Math.max(0,deadline-Date.now())))); continue;
+    }
+    assert.equal(response.status,status,`${sql.slice(0,300)}: ${JSON.stringify(value)}`);
+    if (status === 503 && options.fault) assertFaultBoundary(options.fault,value);
+    return value;
+  }
 }
 async function recover(){const response=await fetch(`${base}/recover`,{method:'POST',headers:{'content-type':'application/json',...auth},body:'{}'});assert.equal(response.status,200);return response.json();}
 const rows = value => value.results.at(-1).rows;

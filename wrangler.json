@@ -1,5 +1,5 @@
 {
-  "name": "murmur-mvcc-v4",
+  "name": "murmur-services-v7",
   "main": "src/index.js",
   "compatibility_date": "2026-01-01",
   "durable_objects": {
@@ -9,22 +9,37 @@
         "class_name": "DataShard"
       },
       {
-        "name": "MEDIATOR",
-        "class_name": "Mediator"
-      },
-      {
         "name": "COORDINATOR",
         "class_name": "Coordinator"
+      },
+      {
+        "name": "SCHEMA",
+        "class_name": "SchemaManager"
+      },
+      {
+        "name": "ALLOCATOR",
+        "class_name": "PlanAllocator"
+      },
+      {
+        "name": "MEDIATORS",
+        "class_name": "PlanBucket"
+      },
+      {
+        "name": "CURSORS",
+        "class_name": "QueryCursor"
       }
     ]
   },
   "migrations": [
     {
-      "tag": "v4-initial",
+      "tag": "v7-initial",
       "new_sqlite_classes": [
         "DataShard",
-        "Mediator",
-        "Coordinator"
+        "PlanAllocator",
+        "PlanBucket",
+        "Coordinator",
+        "SchemaManager",
+        "QueryCursor"
       ]
     }
   ],

@@ -1,0 +1,69 @@
+diff --git a/crates/celld/local_store.rs b/crates/celld/local_store.rs
+index 8c51209..af57ec1 100644
+--- a/crates/celld/local_store.rs
++++ b/crates/celld/local_store.rs
+@@ -108,16 +108,30 @@ impl LocalStore {
+             .ok_or_else(|| not_found(key))
+     }
+ 
+-    fn metadata(&self) -> object_store::Result<Vec<StoredObject>> {
+-        let connection = self.connect()?;
+-        let mut statement = connection
+-            .prepare(
++    fn metadata(&self, prefix: Option<&Path>) -> object_store::Result<Vec<StoredObject>> {
++        // ObjectStore prefixes match whole path components, not raw strings.
++        // Every descendant of a nonempty prefix is in [prefix + "/", prefix + "0")
++        // under SQLite's default BINARY collation. The fixed ASCII delimiter
++        // bounds work for Unicode and literal LIKE/GLOB metacharacters alike.
++        // Keep the existing Rust filters as the final semantic check. Empty
++        // prefixes retain the full scan, and raw paginated prefixes use None.
++        let prefix = prefix.filter(|prefix| !prefix.as_ref().is_empty());
++        let (sql, parameters) = match prefix {
++            Some(prefix) => (
++                "SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body)
++                 FROM objects WHERE key >= ?1 AND key < ?2 ORDER BY key",
++                vec![format!("{prefix}/"), format!("{prefix}0")],
++            ),
++            None => (
+                 "SELECT key, CAST(X'' AS BLOB), etag, modified_ms, attributes, length(body)
+                  FROM objects ORDER BY key",
+-            )
+-            .map_err(db_error)?;
++                Vec::new(),
++            ),
++        };
++        let connection = self.connect()?;
++        let mut statement = connection.prepare(sql).map_err(db_error)?;
+         let rows = statement
+-            .query_map([], |row| {
++            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                 Ok(StoredObject {
+                     key: row.get(0)?,
+                     body: row.get(1)?,
+@@ -296,7 +310,7 @@ impl ObjectStore for LocalStore {
+ 
+     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+         let prefix = prefix.cloned();
+-        let result = self.metadata().and_then(|objects| {
++        let result = self.metadata(prefix.as_ref()).and_then(|objects| {
+             objects
+                 .into_iter()
+                 .map(|object| object_meta(&object))
+@@ -321,7 +335,7 @@ impl ObjectStore for LocalStore {
+         let prefix = prefix.cloned().unwrap_or_default();
+         let mut common_prefixes = BTreeSet::new();
+         let mut objects = Vec::new();
+-        for object in self.metadata()? {
++        for object in self.metadata(Some(&prefix))? {
+             let location = stored_location(&object.key)?;
+             let Some(mut remainder) = location.prefix_match(&prefix) else {
+                 continue;
+@@ -372,7 +386,7 @@ impl PaginatedListStore for LocalStore {
+         let delimiter = options.delimiter.as_deref();
+         let limit = options.max_keys.unwrap_or(usize::MAX);
+         let mut entries: Vec<(String, Option<Path>, Option<ObjectMeta>)> = Vec::new();
+-        for object in self.metadata()? {
++        for object in self.metadata(None)? {
+             let Some(remainder) = object.key.strip_prefix(prefix) else {
+                 continue;
+             };

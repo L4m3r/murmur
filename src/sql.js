@@ -1,6 +1,17 @@
-import { compareKeys } from './keys.js';
+import { compareKeys, encodeKey, keyOfRow, primaryColumns } from './keys.js';
 /** Deliberately bounded SQL subset. No eval, implicit casts, joins or subqueries. */
-export function parse(sql) {
+export function parse(sql, params = {}) {
+  if (params === null || typeof params !== 'object' || Array.isArray(params) || ![Object.prototype,null].includes(Object.getPrototypeOf(params))) throw new Error('params must be a plain object');
+  const bindings = new Map(), used = new Set();
+  for (const key of Reflect.ownKeys(params)) {
+    if (typeof key !== 'string' || !/^[a-zA-Z_][a-zA-Z_0-9]*$/.test(key)) throw new Error('Invalid parameter name');
+    const descriptor = Object.getOwnPropertyDescriptor(params,key);
+    if (!Object.hasOwn(descriptor,'value')) throw new Error('Parameter accessors are not supported');
+    const value = descriptor.value;
+    if (value !== null && !['boolean','string','number'].includes(typeof value)) throw new Error(`Parameter ${key} must be a scalar`);
+    if (typeof value === 'number' && !Number.isFinite(value)) throw new Error(`Parameter ${key} must be finite`);
+    bindings.set(key,value);
+  }
   if (typeof sql !== 'string' || sql.length > 65536) throw new Error('SQL must be a string of at most 65536 characters');
   const tokens = []; let i = 0;
   while (i < sql.length) {
@@ -13,17 +24,19 @@ export function parse(sql) {
       while (i < sql.length) { if (sql[i] === "'") { if (sql[i+1] === "'") { value += "'"; i += 2; } else { i++; closed = true; break; } } else value += sql[i++]; }
       if (!closed) throw new Error('Unterminated string'); tokens.push({kind:'literal',value});
     } else if ((m = rest.match(/^\d+(?:\.\d+)?/))) { tokens.push({kind:'literal',value:Number(m[0])}); i += m[0].length; }
+    else if ((m = rest.match(/^:([a-zA-Z_][a-zA-Z_0-9]*)/))) { tokens.push({kind:'parameter',value:m[1]}); i += m[0].length; }
     else if ((m = rest.match(/^[a-zA-Z_][a-zA-Z_0-9]*/))) { tokens.push({kind:'word',value:m[0].toLowerCase()}); i += m[0].length; }
     else if ((m = rest.match(/^(?:<=|>=|!=|<>|[(),;*=<>+\-])/))) { tokens.push({kind:'symbol',value:m[0]}); i += m[0].length; }
     else throw new Error(`Unsupported SQL character at ${i}`);
   }
   let pos = 0;
-  const peek = () => tokens[pos]?.value;
+  const peek = () => { const token=tokens[pos]; return token?.kind === 'literal' ? '<literal>' : token?.kind === 'parameter' ? `:${token.value}` : token?.value; };
   const take = v => { if (peek() === v) { pos++; return true; } return false; };
   const need = v => { if (!take(v)) throw new Error(`Expected ${v}, got ${peek() ?? 'end'}`); };
   const name = () => { const t = tokens[pos++]; if (t?.kind !== 'word' || ['__proto__','constructor','prototype'].includes(t.value)) throw new Error('Expected safe identifier'); return t.value; };
   const literal = () => { const neg = take('-'); const t = tokens[pos++]; let v;
-    if (t?.kind === 'literal') v = t.value;
+    if (t?.kind === 'parameter') { if (!bindings.has(t.value)) throw new Error(`Missing parameter ${t.value}`); used.add(t.value); v=bindings.get(t.value); }
+    else if (t?.kind === 'literal') v = t.value;
     else if (t?.value === 'null') v = null;
     else if (t?.value === 'true' || t?.value === 'false') v = t.value === 'true';
     else throw new Error('Expected literal');
@@ -44,13 +57,36 @@ export function parse(sql) {
         s = {kind:'createIndex',table,index,column,unique};
       } else {
       need('table'); const table = name(); need('(');
-      const columns = list(() => { const column = {name:name(), type:name().toUpperCase(),primaryKey:false,notNull:false};
+      const columns = []; let declaredKeys = null;
+      do {
+        if (take('primary')) {
+          if (declaredKeys) throw new Error('Only one PRIMARY KEY declaration is allowed');
+          need('key'); need('('); declaredKeys=list(name); need(')');
+          if (peek() !== ')') throw new Error('Table PRIMARY KEY must follow columns');
+          break;
+        }
+        const column={name:name(),type:name().toUpperCase(),primaryKey:false,notNull:false};
         if (!['INTEGER','REAL','TEXT','BOOLEAN'].includes(column.type)) throw new Error('Unsupported column type');
-        while (['primary','not'].includes(peek())) { if (take('primary')) { need('key'); column.primaryKey = true; column.notNull = true; } else { need('not'); need('null'); column.notNull = true; } } return column;
-      }); need(')');
-      if (new Set(columns.map(c=>c.name)).size !== columns.length || columns.filter(c=>c.primaryKey).length !== 1) throw new Error('Require unique column names and exactly one inline PRIMARY KEY');
-      s = {kind:'create',table,columns};
+        while (['primary','not'].includes(peek())) {
+          if (take('primary')) { need('key'); if(column.primaryKey)throw new Error('Duplicate PRIMARY KEY declaration');column.primaryKey=true;column.notNull=true; }
+          else {need('not');need('null');column.notNull=true;}
+        }
+        columns.push(column);
+      } while(take(','));
+      need(')');
+      if (!columns.length || new Set(columns.map(c=>c.name)).size !== columns.length) throw new Error('Require unique column names');
+      const inline=columns.filter(c=>c.primaryKey).map(c=>c.name);
+      if (declaredKeys && inline.length) throw new Error('Cannot combine inline and table PRIMARY KEY');
+      const primaryKeys=declaredKeys || inline;
+      if (!primaryKeys.length || (!declaredKeys && inline.length!==1) || new Set(primaryKeys).size!==primaryKeys.length) throw new Error('Require exactly one PRIMARY KEY declaration with unique columns');
+      for(const key of primaryKeys) {
+        const column=columns.find(c=>c.name===key);
+        if(!column)throw new Error(`Unknown primary key column ${key}`);
+        column.primaryKey=true;column.notNull=true;
       }
+      s = {kind:'create',table,columns,primaryKeys};
+      }
+    } else if (take('drop')) { if(take('table'))s={kind:'dropTable',table:name()};else{need('index'); const index=name(); need('on'); const table=name(); s={kind:'dropIndex',table,index};}
     } else if (['insert','upsert'].includes(peek())) {
       const kind = tokens[pos++].value; need('into'); const table = name(); need('('); const columns = list(name); need(')'); need('values');
       const values = list(() => { need('('); const row = list(literal); need(')'); return row; });
@@ -71,6 +107,7 @@ export function parse(sql) {
   }
   if (wrapper && !committed) throw new Error('BEGIN requires COMMIT');
   if (!statements.length) throw new Error('No statements');
+  for (const key of bindings.keys()) if (!used.has(key)) throw new Error(`Unused parameter ${key}`);
   return statements;
 }
 
@@ -95,7 +132,7 @@ export function execute(statements, catalog, tables) {
   };
   const validateIndexes = (schema, rows) => {
     for (const index of schema.indexes || []) {
-      if (!index.unique) continue;
+      if (!index.unique || index.state === 'building') continue;
       const seen = new Set();
       for (const row of rows) {
         const value = row[index.column];
@@ -107,18 +144,29 @@ export function execute(statements, catalog, tables) {
   };
   for (const s of statements) {
     if (s.kind === 'create') {
-      if (Object.hasOwn(catalog,s.table)) throw new Error(`Table ${s.table} exists`);
-      if (Object.keys(catalog).length >= 32) throw new Error('At most 32 tables');
-      catalog[s.table] = {columns:s.columns,primaryKey:s.columns.find(c=>c.primaryKey).name,indexes:[]}; tables[s.table] = []; results.push({rowsAffected:0}); continue;
+      const prior=Object.hasOwn(catalog,s.table)?catalog[s.table]:null;
+      if (prior && prior.state!=='dropped') throw new Error(`Table ${s.table} exists`);
+      if (Object.values(catalog).filter(schema=>schema.state!=='dropped').length >= 32) throw new Error('At most 32 tables');
+      const generation=prior?(prior.generation??0)+1:0;
+      if(!Number.isSafeInteger(generation))throw new Error('Table generation exhausted');
+      catalog[s.table] = {generation,storageName:generation?`${s.table}~g${generation}`:s.table,columns:s.columns,primaryKeys:s.primaryKeys || s.columns.filter(c=>c.primaryKey).map(c=>c.name),primaryKey:(s.primaryKeys || s.columns.filter(c=>c.primaryKey).map(c=>c.name))[0],indexes:[]}; tables[s.table] = []; results.push({rowsAffected:0}); continue;
     }
-    const schema = Object.hasOwn(catalog,s.table) && catalog[s.table]; if (!schema) throw new Error(`Unknown table ${s.table}`);
-    const rows = tables[s.table]; const pk = schema.primaryKey;
+    const schema = Object.hasOwn(catalog,s.table) && catalog[s.table]; if (!schema || schema.state==='dropped') throw new Error(`Unknown table ${s.table}`);
+    if(s.kind==='dropTable'){catalog[s.table]={...schema,state:'dropped',generation:schema.generation??0,storageName:schema.storageName||s.table};tables[s.table]=[];results.push({rowsAffected:0});continue;}
+    const rows = tables[s.table]; const keys = primaryColumns(schema);
+    if (s.kind === 'dropIndex') {
+      if (!(schema.indexes || []).some(index=>index.name===s.index)) throw new Error(`Unknown index ${s.index}`);
+      schema.indexGenerations = { ...(schema.indexGenerations || {}), [s.index]: (schema.indexGenerations?.[s.index] || 0) + 1 };
+      schema.indexes=schema.indexes.filter(index=>index.name!==s.index);
+      results.push({rowsAffected:0}); continue;
+    }
     if (s.kind === 'createIndex') {
       known(schema,s.column);
       const indexes = schema.indexes || [];
       if (indexes.some(index => index.name === s.index)) throw new Error(`Index ${s.index} exists`);
       if (indexes.length >= 16) throw new Error('At most 16 indexes per table');
-      schema.indexes = [...indexes,{name:s.index,column:s.column,unique:s.unique}];
+      const generation = schema.indexGenerations?.[s.index] || 0;
+      schema.indexes = [...indexes,{name:s.index,column:s.column,unique:s.unique,...(generation ? {storageName:`${s.index}~${generation}`} : {})}];
       validateIndexes(schema,rows);
       results.push({rowsAffected:0}); continue;
     }
@@ -129,7 +177,7 @@ export function execute(statements, catalog, tables) {
       for (const values of s.values) {
         if (values.length !== s.columns.length) throw new Error('Column/value count mismatch');
         const row = Object.fromEntries(schema.columns.map(c=>[c.name,null])); s.columns.forEach((c,i)=>row[c]=values[i]); schema.columns.forEach(c=>check(c,row[c.name]));
-        const idx = rows.findIndex(r=>r[pk] === row[pk]); if (idx >= 0 && s.kind === 'insert') throw new Error('Duplicate primary key');
+        const encoded=encodeKey(keyOfRow(schema,row)); const idx = rows.findIndex(r=>encodeKey(keyOfRow(schema,r)) === encoded); if (idx >= 0 && s.kind === 'insert') throw new Error('Duplicate primary key');
         if (idx >= 0) rows[idx] = row; else rows.push(row);
         if (rows.length > 10000) throw new Error('At most 10000 rows per table');
       } results.push({rowsAffected:s.values.length});
@@ -143,7 +191,7 @@ export function execute(statements, catalog, tables) {
       if (new Set(s.assignments.map(a=>a.column)).size !== s.assignments.length) throw new Error('Duplicate update column');
       for (const a of s.assignments) {
         const target = known(schema,a.column);
-        if (a.column === pk) throw new Error('Primary key updates are not supported');
+        if (keys.includes(a.column)) throw new Error('Primary key updates are not supported');
         if (a.expression.column) {
           const source = known(schema,a.expression.column);
           if (a.expression.op && (!['INTEGER','REAL'].includes(source.type) || typeof a.expression.value !== 'number' || !Number.isFinite(a.expression.value))) throw new Error('Arithmetic requires numeric operands');

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import Worker,{Coordinator,DataShard,Mediator} from '../src/index.js';
+import Worker,{Coordinator,DataShard,PlanAllocator,PlanBucket} from '../src/index.js';
 
 // Memory protocol model only; process durability is covered by celld E2E tests.
 function storage(){
@@ -17,7 +17,7 @@ function storage(){
 function cluster(){
  const env={ALLOW_FAULTS:'true',TABLET_SPLIT_BYTES:'1024',TABLET_MERGE_BYTES:'256'},namespaces=[];
  function namespace(Type){const states=new Map(),actors=new Map();const ns={idFromName:name=>name,get(name){return{async fetch(url,init){if(!states.has(name))states.set(name,{storage:storage(),id:{name,toString:()=>name},blockConcurrencyWhile:fn=>fn()});if(!actors.has(name))actors.set(name,new Type(states.get(name),env));return actors.get(name).fetch(new Request(url,init));}};},reset(){actors.clear();}};namespaces.push(ns);return ns;}
- env.SHARDS=namespace(DataShard);env.MEDIATOR=namespace(Mediator);env.COORDINATOR=namespace(Coordinator);
+ env.SHARDS=namespace(DataShard);env.ALLOCATOR=namespace(PlanAllocator);env.MEDIATORS=namespace(PlanBucket);env.COORDINATOR=namespace(Coordinator);
  let sequence=0;return{restart(){namespaces.forEach(ns=>ns.reset());},async post(path,body={}){const response=await Worker.fetch(new Request(`http://127.0.0.1${path}`,{method:'POST',body:JSON.stringify(body)}),env);return{status:response.status,body:await response.json()};},query(sql,extra={}){return this.post('/query',{sql,idempotencyKey:`request_${++sequence}`,...extra});}};
 }
 for(const fault of ['after-prepare','after-commit-ready','after-plan','after-first-commit'])test(`MVCC coordinator reset ${fault} preserves snapshot and resolves durable intent`,async()=>{
