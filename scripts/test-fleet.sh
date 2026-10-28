@@ -11,7 +11,7 @@ if [[ -z "$CELLD" ]];then for p in "$ROOT/.tools/bin/celld" "$ROOT/../celld-tool
 CELLD=${CELLD:-celld};PYTHON=${MOTO_PYTHON:-"$(dirname "$MOTO")/python"}
 [[ -x "$MOTO" && -x "$PYTHON" ]] || { echo 'Install moto[server]==5.1.15 in an isolated venv and set MOTO_BIN/MOTO_PYTHON.' >&2;exit 1; }
 WORK=$(mktemp -d);PIDS=''
-cleanup(){ status=$?;for p in $PIDS;do kill -TERM "$p" 2>/dev/null || true;done;for p in $PIDS;do wait "$p" 2>/dev/null || true;done;if [[ $status != 0 ]];then tail -60 "$WORK/a.log" "$WORK/b.log" >&2 || true;fi;rm -rf "$WORK"; }
+cleanup(){ status=$?;for p in $PIDS;do kill -TERM "$p" 2>/dev/null || true;done;for p in $PIDS;do wait "$p" 2>/dev/null || true;done;if [[ $status != 0 ]];then artifacts=${TEST_ARTIFACT_DIR:-/tmp/actor-db-test-artifacts};mkdir -p "$artifacts";for node in a b;do cp "$WORK/$node.log" "$artifacts/fleet-$node-$(date +%s).log" || true;done;tail -n 60 "$WORK/a.log" "$WORK/b.log" >&2 || true;fi;rm -rf "$WORK"; }
 trap cleanup EXIT
 export AWS_ACCESS_KEY_ID=synthetic-test-key AWS_SECRET_ACCESS_KEY=synthetic-test-secret AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true
 export PATH="$ROOT/node_modules/.bin:$PATH"

@@ -1,8 +1,6 @@
 name: Tests
+# Automatic tests are disabled by request; run locally by default.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 permissions:
   contents: read

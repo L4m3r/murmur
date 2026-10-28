@@ -466,9 +466,9 @@ export default {
         const actor=env.CURSORS.get(env.CURSORS.idFromName(id));
         for(let attempt=0;attempt<40;attempt++){
           const response=await actor.fetch('https://cursor',{method:'POST',body:JSON.stringify({...input,op:operation,id,epoch})});
-          const result=await decodeRpcResponse(response.clone(),`cursor/${id}:${operation}`);
+          const result=await decodeRpcResponse(response,`cursor/${id}:${operation}`);
           if(response.status===409&&result.code==='VISIBILITY_PENDING'){await helpDependencies(env,result);continue;}
-          return response;
+          return json(result,response.status);
         }
         return json({error:'Cursor dependencies are still resolving',code:'VISIBILITY_PENDING',retryable:true},503);
       }
@@ -553,14 +553,14 @@ export default {
       const owner=await coordinatorFor(`${epoch}:${input.idempotencyKey}`),coordinator=env.COORDINATOR.get(env.COORDINATOR.idFromName(coordinatorName(owner)));
       for(let attempt=0;attempt<40;attempt++){
         const response=await coordinator.fetch('https://coordinator',{method:'POST',body:JSON.stringify({...input,coordinatorId:owner,scope:owner})});
-        const result=await decodeRpcResponse(response.clone(),`${owner}:query`);
+        const result=await decodeRpcResponse(response,`${owner}:query`);
         if(response.status===409&&result.retryable){
           await helpDependencies(env,result);
           await new Promise(resolve=>setTimeout(resolve,5+attempt*2));continue;
         }
         // All own participants are applied before Coordinator returns success.
         // Reads at allocated snapshots wait only on relevant local dependencies.
-        return response;
+        return json(result,response.status);
       }
       return json({error:'Serialization conflict; retry same key',code:'CONFLICT',retryable:true},503);
     }catch(error){return json({error:error.message,code:error.code||'RECOVERY_REQUIRED',retryable:![400,410].includes(error.status),rpc:error.rpc,retryAfterMs:error.retryAfterMs},error.status||503);}
