@@ -1,10 +1,11 @@
+import {queryRequest} from './http-query.mjs';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 const base=process.env.BASE_URL||'http://127.0.0.1:9876';
 const auth=process.env.API_TOKEN?{authorization:`Bearer ${process.env.API_TOKEN}`} : {};
 async function query(sql,expected=200){
-  const response=await fetch(`${base}/query`,{method:'POST',headers:{'content-type':'application/json',...auth},body:JSON.stringify({sql,idempotencyKey:randomUUID()})});
-  const result=await response.json();assert.equal(response.status,expected,`${sql.slice(0,150)}: ${JSON.stringify(result)}`);return result;
+  const result=await queryRequest(base,{sql,idempotencyKey:randomUUID()},{headers:auth,expected});
+  assert.equal(result.status,expected,`${sql.slice(0,150)}: ${JSON.stringify(result.body)}`);return result.body;
 }
 const rows=result=>result.results.at(-1).rows;
 const stamp=Date.now().toString(36), table=`ordered_${stamp}`;

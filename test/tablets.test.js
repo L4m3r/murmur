@@ -57,3 +57,90 @@ test('legacy hash maps, duplicate physical keys and invalid thresholds fail clos
  assert.throws(()=>planTablets(schema,[],{splitBytes:100,mergeBytes:200}));
  assert.throws(()=>planTablets({...schema,epoch:1,tablets:[{id:'a',start:null,end:10},{id:'b',start:9,end:null}]},[]));
 });
+
+test('full planning preserves unchanged actor epochs across a split',()=>{
+ const s={...schema,epoch:7,tablets:[{id:'left',start:null,end:10,epoch:2},{id:'right',start:10,end:null,epoch:5}]};
+ const rows=[{id:1,payload:'x'.repeat(20)},{id:10,payload:'x'.repeat(100)},{id:11,payload:'x'.repeat(100)}];
+ const p=planTablets(s,rows,{splitBytes:180,mergeBytes:2});
+ assert.equal(p.schema.epoch,8);
+ assert.deepEqual(p.schema.tablets[0],s.tablets[0]);
+ assert.equal(p.partitions.find(t=>t.id==='left').epoch,2);
+ assert.ok(p.schema.tablets.slice(1).every(t=>t.epoch===8));
+ assert.ok(p.partitions.filter(t=>t.id!=='left').every(t=>t.epoch===8));
+ assert.deepEqual(s.tablets.map(t=>t.epoch),[2,5]);
+});
+
+test('affected planning keeps unloaded tablet identities and epochs unchanged',async()=>{
+ const {planAffectedTablets,tabletEpoch}=await import('../src/tablets.js');
+ const s={...schema,epoch:9,tablets:[{id:'left',start:null,end:10,epoch:3},{id:'right',start:10,end:null,epoch:7}]};
+ const p=planAffectedTablets(s,new Map([['right',[{id:10,payload:'x'.repeat(100)},{id:11,payload:'x'.repeat(100)}]]]),{splitBytes:180,mergeBytes:2});
+ assert.equal(p.schema.epoch,10); assert.deepEqual(p.schema.tablets[0],s.tablets[0]);
+ assert.ok(!p.partitions.some(t=>t.id==='left'));
+ assert.ok(p.partitions.every(t=>t.epoch===10));
+ assert.equal(tabletEpoch(p.schema,'left'),3);
+ const unchanged=planAffectedTablets(p.schema,new Map(),{splitBytes:180,mergeBytes:2});
+ assert.equal(unchanged.changed,false);assert.deepEqual(unchanged.schema,p.schema);
+});
+
+test('merge replacements get one new epoch without changing distant actors',async()=>{
+ const {planAffectedTablets}=await import('../src/tablets.js');
+ const s={...schema,epoch:12,tablets:[{id:'a',start:null,end:10,epoch:2},{id:'b',start:10,end:20,epoch:9},{id:'c',start:20,end:null,epoch:11}]};
+ const p=planAffectedTablets(s,new Map([['a',[]],['b',[]]]));
+ assert.equal(p.schema.epoch,13);assert.equal(p.schema.tablets[0].epoch,13);
+ assert.deepEqual(p.schema.tablets[1],s.tablets[2]);
+ assert.deepEqual(p.schema.tablets.map(({start,end})=>({start,end})),[{start:null,end:20},{start:20,end:null}]);
+ assert.equal(p.partitions.length,1);assert.equal(p.partitions[0].epoch,13);
+});
+
+test('descriptor epoch fallback, validation, initialization and overflow guard',async()=>{
+ const {tabletEpoch,planAffectedTablets}=await import('../src/tablets.js');
+ const legacy={...schema,epoch:6,tablets:[{id:'fixture',start:null,end:null}]};
+ assert.equal(tabletEpoch(legacy,'fixture'),6);
+ assert.equal(planAffectedTablets(legacy,new Map()).schema.tablets[0].epoch,6);
+ assert.equal(planTablets(schema,[]).schema.tablets[0].epoch,1);
+ assert.throws(()=>tabletEpoch(legacy,'missing'),/Unknown/);
+ for(const epoch of [0,null,1.5,7])assert.throws(()=>planAffectedTablets({...legacy,tablets:[{...legacy.tablets[0],epoch}]},new Map()),/epoch/);
+ const max={...legacy,epoch:Number.MAX_SAFE_INTEGER};
+ assert.throws(()=>planTablets(max,[{id:1,payload:'x'.repeat(100)},{id:2,payload:'x'.repeat(100)}],{splitBytes:180,mergeBytes:2}),/exhausted/);
+});
+
+test('default ceiling permits more than 64 tablets and configuration remains bounded',()=>{
+ const p=planTablets(schema,data,{splitBytes:50,mergeBytes:2});
+ assert.equal(p.schema.tablets.length,100);
+ assert.equal(planTablets(schema,[],{maxTablets:4096}).schema.tablets.length,1);
+ assert.throws(()=>planTablets(schema,[],{maxTablets:4097}),/sizing/);
+});
+
+test('4096-tablet point routing and bounded range visit logarithmic descriptors',()=>{
+ let inspected=0;
+ const tablets=Array.from({length:4096},(_,i)=>({id:`t${i}`,epoch:1,get start(){inspected++;return i===0?null:i;},get end(){inspected++;return i===4095?null:i+1;}}));
+ const s={...schema,epoch:1,tablets};
+ assert.equal(routeTablet(s,2048.5),'t2048');
+ assert.ok(inspected<32,`point routing inspected ${inspected} bounds`);
+ inspected=0;
+ const range=rangeForFilters([{column:'id',op:'>=',value:2048},{column:'id',op:'<=',value:2050}],'id');
+ assert.deepEqual(selectTablets(s,range).map(t=>t.id),['t2048','t2049','t2050']);
+ assert.ok(inspected<32,`range routing inspected ${inspected} bounds`);
+});
+
+test('binary routing matches linear oracle at all boundaries and unbounded ends',()=>{
+ const tablets=Array.from({length:256},(_,i)=>({id:`t${i}`,start:i===0?null:i,end:i===255?null:i+1,epoch:1}));
+ const s={...schema,epoch:1,tablets};
+ const before=structuredClone(s);
+ for(const key of [-100,0,...Array.from({length:256},(_,i)=>i),255.5,1000]) {
+   const expected=tablets.find(t=>(t.start===null||key>=t.start)&&(t.end===null||key<t.end));
+   assert.equal(routeTablet(s,key),expected.id);
+ }
+ for(const [op,value] of [['<',1],['<=',1],['>',254],['>=',255],['=',128],['=',-100],['=',1000]]) {
+   const r=rangeForFilters([{column:'id',op,value}],'id');
+   const expected=tablets.filter(t=>{
+     if(t.end!==null && r.lower!==null && compareKeys(t.end,value)<=0 && ['>','>=','='].includes(op))return false;
+     if(t.start!==null && ['<','<=','='].includes(op) && (t.start>value||(t.start===value&&op==='<')))return false;
+     return true;
+   });
+   assert.deepEqual(selectTablets(s,r).map(t=>t.id),expected.map(t=>t.id),`${op} ${value}`);
+ }
+ const unbounded={lower:null,upper:null,lowerInclusive:true,upperInclusive:false,empty:false};
+ assert.deepEqual(selectTablets(s,unbounded),tablets);
+ assert.deepEqual(s,before);
+});

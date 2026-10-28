@@ -1,6 +1,8 @@
+import {queryWithBackgroundTurns} from './pending-query-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import Worker, {Coordinator, DataShard, Mediator} from '../src/index.js';
+import Worker, {Coordinator, DataShard, PlanAllocator, PlanBucket} from '../src/index.js';
+import {manifestHash} from '../src/protocol.js';
 
 // Independent model of DO ordered KV. Assertions inspect actual storage reads,
 // not only optimizer plan labels. This is not a process-durability claim.
@@ -35,11 +37,10 @@ function cluster() {
       return {fetch:async(url,init)=>{calls.push({kind:name.startsWith("base/")?"ROWS":name.startsWith("index/")?"INDEXES":kind,name,body:JSON.parse(init.body)});return actors.get(name).fetch(new Request(url,init));}};
     },reset(){actors.clear();}};
   }
-  for(const [kind,Type] of Object.entries({SHARDS:DataShard,MEDIATOR:Mediator,COORDINATOR:Coordinator}))env[kind]=namespace(Type,kind);
+  for(const [kind,Type] of Object.entries({SHARDS:DataShard,ALLOCATOR:PlanAllocator,MEDIATORS:PlanBucket,COORDINATOR:Coordinator}))env[kind]=namespace(Type,kind);
   let seq=0;
   return {io,calls,env,async recover(){const r=await Worker.fetch(new Request('http://127.0.0.1/recover',{method:'POST',body:'{}'}),env);assert.equal(r.status,200);},clear(){io.length=0;calls.length=0;},restart(){for(const ns of Object.values(env))ns?.reset?.();},async query(sql,extra={}){
-    const result=await Worker.fetch(new Request('http://127.0.0.1/query',{method:'POST',body:JSON.stringify({sql,idempotencyKey:`ordered-${++seq}`,...extra})}),env);
-    return {status:result.status,...await result.json()};
+    return queryWithBackgroundTurns(env,{sql,idempotencyKey:`ordered-${++seq}`,...extra});
   }};
 }
 const rows = response => response.results.at(-1).rows;
@@ -216,10 +217,12 @@ test('nonkey long TEXT supports SQL comparisons and sorting but oversized physic
 
 test('split and merge decisions recover both base and index epochs before exposing routes',async()=>{
   const db=cluster();
+  async function reachPartialFault(sql,key){for(let i=0;i<128;i++){const result=await db.query(sql,{fault:'after-first-commit',idempotencyKey:key});if(result.code==='PLAN_PENDING'){assert.equal(result.status,503);assert.equal(result.faultReached,false);continue;}assert.equal(result.code,'FAULT_INJECTED',JSON.stringify(result));assert.equal(result.faultReached,true);assert.equal(result.faultState.appliedCount,1);assert.ok(result.faultState.appliedCount<result.faultState.participantCount);return;}assert.fail('Partial-apply milestone not reached');}
+
   const initial=must(await db.query("CREATE TABLE a (id INTEGER PRIMARY KEY, tag TEXT); CREATE INDEX tag_idx ON a (tag); INSERT INTO a (id,tag) VALUES (-1,'seed')"));
   const oldIndex=initial.routing[0].indexes[0];
   const sql=`INSERT INTO a (id,tag) VALUES ${Array.from({length:35},(_,i)=>`(${i},'same')`).join(',')}`;
-  assert.equal((await db.query(sql,{fault:'after-first-commit',idempotencyKey:'split-crash'})).status,503);
+  await reachPartialFault(sql,'split-crash');
   db.restart();
   await db.recover();
   const after=must(await db.query("SELECT id FROM a WHERE tag='same' ORDER BY id"));
@@ -230,9 +233,20 @@ test('split and merge decisions recover both base and index epochs before exposi
   async function invoke(name,body){const response=await db.env.SHARDS.get(name).fetch('https://internal',{method:'POST',body:JSON.stringify(body)});return {status:response.status,...await response.json()};}
   const oldName=`index/a/tag_idx/${oldIndex.tablets[0].id}`;
   assert.equal((await invoke(oldName,{op:'scan',snapshot:after.version,epoch:oldIndex.epoch})).code,'STALE_EPOCH');
-  assert.equal((await invoke(oldName,{op:'prepare',id:'delayed-index-prepare',snapshot:initial.version,expectedEpoch:oldIndex.epoch,reads:[],changes:[{key:['bad',999],row:{value:'bad',pk:999}}]})).code,'CONFLICT');
+  // A stale proposal may be persisted, but only a signed planned validation
+  // vote decides it; retired routing must produce ABORT, never mutate rows.
+  async function control(binding,name,body){const response=await db.env[binding].get(name).fetch('https://internal',{method:'POST',body:JSON.stringify(body)});return {status:response.status,...await response.json()};}
+  const lateId='e0_delayed-index-proposal';
+  must(await control('ALLOCATOR','global',{op:'pin',id:lateId,owner:'late',snapshot:initial.version}));
+  const proposal=must(await invoke(oldName,{op:'propose',id:lateId,name:oldName,owner:'late',epoch:0,snapshot:initial.version,participants:[oldName],expectedEpoch:oldIndex.epoch,reads:[],changes:[{key:['bad',999],row:{value:'bad',pk:999}}]}));
+  const participants=[{name:oldName,bodyHash:proposal.bodyHash,publicKey:proposal.publicKey}];
+  const {status,...association}=must(await control('ALLOCATOR','global',{op:'assign',id:lateId,owner:'late',epoch:0,snapshot:initial.version,participants,manifestHash:await manifestHash(participants)}));
+  must(await control('MEDIATORS',association.bucket,{op:'register',association}));
+  assert.equal(must(await invoke(oldName,{op:'drive',id:lateId})).outcome,'ABORT');
+  must(await control('ALLOCATOR','global',{op:'completion',id:lateId}));
+  must(await control('ALLOCATOR','global',{op:'unpin',id:lateId}));
   must(await db.query(sql,{idempotencyKey:'split-crash'}));
-  assert.equal((await db.query('DELETE FROM a',{fault:'after-first-commit',idempotencyKey:'merge-crash'})).status,503);
+  await reachPartialFault('DELETE FROM a','merge-crash');
   db.restart();
   await db.recover();
   const merged=must(await db.query("SELECT * FROM a WHERE tag>=''"));
@@ -272,12 +286,12 @@ test('bounded MVCC scans separate visible rows from retained physical versions',
   const latest=must(await db.query('SELECT * FROM history WHERE id=2'));
   assert.deepEqual(rows(latest),[{id:2,n:22}]);
   assert.equal(latest.plan.rowsRead,1);
-  assert.equal(latest.plan.versionsRead,3);
+  assert.equal(latest.plan.versionsRead,1);
   const physical=db.io.filter(x=>x.kind==='ROWS'&&x.op==='list'&&x.keys.some(k=>k.startsWith('row:')));
-  assert.equal(physical.flatMap(x=>x.values).length,3);
+  assert.equal(physical.flatMap(x=>x.values).length,1);
   assert.ok(physical.every(x=>x.values.every(v=>v.key===2&&v.row.id===2)),'History reads remain physically key-bounded');
   const old=must(await db.query('SELECT * FROM history WHERE id=2',{snapshot:initial.version}));
   assert.deepEqual(rows(old),[{id:2,n:20}]);
   assert.equal(old.plan.rowsRead,1);
-  assert.equal(old.plan.versionsRead,3);
+  assert.equal(old.plan.versionsRead,1);
 });

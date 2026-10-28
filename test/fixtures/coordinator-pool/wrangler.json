@@ -1,0 +1,8 @@
+{
+  "name":"murmur-pool-synthetic-test",
+  "main":"worker.js",
+  "compatibility_date":"2026-01-01",
+  "durable_objects":{"bindings":[{"name":"COORDINATOR","class_name":"Pool"},{"name":"GATES","class_name":"Gate"}]},
+  "migrations":[{"tag":"pool-test-v1","new_sqlite_classes":["Pool","Gate"]}],
+  "vars":{"COORDINATOR_ALARM_BATCH":"1","COORDINATOR_ALARM_SLICE_MS":"50"}
+}

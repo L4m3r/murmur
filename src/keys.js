@@ -37,9 +37,43 @@ export function compareKeys(a, b) {
   const x = encodeUnchecked(a), y = encodeUnchecked(b);
   return x === y ? 0 : x < y ? -1 : 1;
 }
-export function keyOfRow(schema, row) {
-  return schema.keyColumns ? schema.keyColumns.map(column => row[column]) : row[schema.primaryKey];
+export function primaryColumns(schema) {
+  return schema.primaryKeys || [schema.primaryKey];
 }
+export function keyOfRow(schema, row) {
+  if (schema.keyColumns) return schema.keyColumns.map(column=>row[column]);
+  const columns=primaryColumns(schema);
+  return columns.length===1 ? row[columns[0]] : columns.map(column=>row[column]);
+}
+/** Encoded half-open prefix bounds for lexicographically ordered primary keys.
+ * Bounds on a nonleading component are residual unless every earlier component
+ * is equality-bound. Full tuple equality stays an exact physical point.
+ */
+export function primaryRangeForFilters(schema, filters = []) {
+  const columns=primaryColumns(schema);
+  if(columns.length===1)return rangeForFilters(filters,columns[0]);
+  const empty=()=>({lower:null,upper:null,lowerInclusive:true,upperInclusive:false,empty:true});
+  const prefix=[];
+  for(let i=0;i<columns.length;i++) {
+    const column=columns[i], selected=filters.filter(f=>f.column===column);
+    const scalar=rangeForFilters(selected,column);
+    if(scalar.empty)return empty();
+    const equal=selected.find(f=>f.op==='=');
+    if(equal) {prefix.push(equal.value);continue;}
+    const base=encodeKey(prefix);
+    const range={lower:prefix.length?base:null,upper:prefix.length?base+'~':null,lowerInclusive:true,upperInclusive:false,empty:false};
+    if(!selected.length)return range;
+    const hasSuffix=i<columns.length-1;
+    const bounded=rangeForFilters(selected,column,{compositePrefix:hasSuffix});
+    if(bounded.empty)return empty();
+    if(bounded.lower!==null) {range.lower=base+(hasSuffix?bounded.lower.slice(1):bounded.lower);range.lowerInclusive=bounded.lowerInclusive;}
+    if(bounded.upper!==null) {range.upper=base+(hasSuffix?bounded.upper.slice(1):bounded.upper);range.upperInclusive=bounded.upperInclusive;}
+    return range;
+  }
+  const encoded=encodeKey(prefix);
+  return {lower:encoded,upper:encoded,lowerInclusive:true,upperInclusive:true,empty:false};
+}
+
 export function rangeForFilters(filters, column, { compositePrefix = false } = {}) {
   const range = { lower: null, upper: null, lowerInclusive: true, upperInclusive: false, empty: false };
   function lower(value, inclusive) {

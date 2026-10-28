@@ -1,0 +1,43 @@
+name: Tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Install pinned celld v0.6.3
+        run: npm run setup:celld
+      - name: Unit and protocol tests
+        run: npm test
+      - name: Pooled coordinator alarm fairness and persistence
+        run: npm run test:coordinator-pool
+      - name: Real celld integration and crash recovery
+        run: npm run test:e2e
+      - name: Storage scale, chunking and crash recovery
+        run: npm run test:storage
+      - name: Retention, metadata cleanup and crash recovery
+        run: npm run test:retention
+      - name: Composite keys, named parameters and index lifecycle
+        run: npm run test:composite
+      - name: Online index validation, resumable DROP and crash recovery
+        run: npm run test:online-index
+      - name: Bounded query pagination and snapshot cursor lifecycle
+        run: npm run test:query-pagination
+      - name: Install pinned local S3 test emulator
+        run: npm run setup:moto
+      - name: Two-process celld fleet and owner failure
+        run: npm run test:fleet
