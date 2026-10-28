@@ -31,7 +31,11 @@ export async function queryRequest(base,input,{headers={},expected=200,totalMs=3
    log({event:pending?'PLAN_PENDING':'RETRY',...context,attempt:attempts,elapsedMs:elapsed(),code:body.code,error:body.error,retryAfterMs,rpc:body.rpc});
   }
   if(unexpectedRetries>maxUnexpectedRetries)throw new Error(`Unexpected retry budget exceeded; retry exact identity ${input.idempotencyKey}`);
-  const delay=Math.min(Math.max(pollMs,retryAfterMs),Math.max(0,deadline-Date.now()));
-  if(delay)await new Promise(resolve=>setTimeout(resolve,delay));
+  const requiredDelay=Math.max(pollMs,retryAfterMs),waitBudget=deadline-Date.now();
+  // A timer may wake early. Never shorten Retry-After to the remaining budget
+  // and then accidentally admit another attempt before the upstream permits it.
+  if(waitBudget<=0||requiredDelay>=waitBudget)throw new Error(`Query operation deadline cannot accommodate retry delay; retry exact identity ${input.idempotencyKey}`);
+  const retryAt=Date.now()+requiredDelay;
+  while(Date.now()<retryAt)await new Promise(resolve=>setTimeout(resolve,retryAt-Date.now()));
  }
 }
