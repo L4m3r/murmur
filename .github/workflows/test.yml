@@ -1,6 +1,7 @@
 name: Tests
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -10,34 +11,72 @@ concurrency:
   cancel-in-progress: true
 jobs:
   test:
+    name: ${{ matrix.runtime }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    # Rust compilation has its own allowance; test request/operation deadlines
+    # and assertions are identical in both lanes and remain unchanged.
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime: stock-celld-compatibility
+            timeout: 25
+          - runtime: experimental-prefix-patch-qualification
+            timeout: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      TEST_ARTIFACT_DIR: ${{ github.workspace }}/diagnostics/runtime
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
           cache: npm
-      - run: npm ci
-      - name: Install pinned celld v0.6.3
+      - run: mkdir -p diagnostics && npm ci
+      - name: Install official celld v0.6.3 (stock lane)
+        if: matrix.runtime == 'stock-celld-compatibility'
         run: npm run setup:celld
+      - name: Build explicit experimental runtime from pinned source
+        if: matrix.runtime == 'experimental-prefix-patch-qualification'
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal
+          bash scripts/build-experimental-celld.sh 2>&1 | tee diagnostics/experimental-build.log
+          cat .tools/celld-prefix-experimental/identity.txt | tee diagnostics/experimental-identity.log
+          echo "CELLD_BIN=$PWD/.tools/celld-prefix-experimental/bin/celld" >> "$GITHUB_ENV"
+      - name: Record runtime identity and qualification boundary
+        run: |
+          runtime="${CELLD_BIN:-$PWD/.tools/bin/celld}"
+          { git rev-parse HEAD; "$runtime" --version; sha256sum "$runtime"; } | tee diagnostics/runtime-identity.log
+          echo '### ${{ matrix.runtime }}' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Stock failures remain blocking. Experimental success does not qualify official celld or hosted Workers.' >> "$GITHUB_STEP_SUMMARY"
       - name: Unit and protocol tests
-        run: npm test
+        run: npm test 2>&1 | tee diagnostics/unit.log
       - name: Pooled coordinator alarm fairness and persistence
-        run: npm run test:coordinator-pool
+        run: npm run test:coordinator-pool 2>&1 | tee diagnostics/pool.log
       - name: Real celld integration and crash recovery
-        run: npm run test:e2e
+        run: npm run test:e2e 2>&1 | tee diagnostics/e2e.log
       - name: Storage scale, chunking and crash recovery
-        run: npm run test:storage
+        run: npm run test:storage 2>&1 | tee diagnostics/storage.log
       - name: Retention, metadata cleanup and crash recovery
-        run: npm run test:retention
+        run: npm run test:retention 2>&1 | tee diagnostics/retention.log
       - name: Composite keys, named parameters and index lifecycle
-        run: npm run test:composite
+        run: npm run test:composite 2>&1 | tee diagnostics/composite.log
       - name: Online index validation, resumable DROP and crash recovery
-        run: npm run test:online-index
+        run: npm run test:online-index 2>&1 | tee diagnostics/online-index.log
       - name: Bounded query pagination and snapshot cursor lifecycle
-        run: npm run test:query-pagination
+        run: npm run test:query-pagination 2>&1 | tee diagnostics/pagination.log
       - name: Install pinned local S3 test emulator
         run: npm run setup:moto
       - name: Two-process celld fleet and owner failure
-        run: npm run test:fleet
+        run: npm run test:fleet 2>&1 | tee diagnostics/fleet.log
+      - name: Preserve qualification diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: diagnostics-${{ matrix.runtime }}-${{ github.run_attempt }}
+          path: diagnostics/**/*.log
+          if-no-files-found: warn
+          retention-days: 7
