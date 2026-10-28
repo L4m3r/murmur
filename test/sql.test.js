@@ -20,3 +20,45 @@ test('updates evaluate assignments from old row and NULL is SQL unknown',()=>{
  const x=run('CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER); INSERT INTO a (id,x,y) VALUES (1,2,3),(2,NULL,4); UPDATE a SET x=y,y=x WHERE id=1; SELECT * FROM a WHERE x=NULL');
  assert.deepEqual(x.tables.a[0],{id:1,x:3,y:2}); assert.deepEqual(x.results.at(-1).rows,[]);
 });
+test('CREATE INDEX AST, metadata and per-table name constraints',()=>{
+ assert.deepEqual(parse('CREATE UNIQUE INDEX by_label ON a(label)'),[{kind:'createIndex',table:'a',index:'by_label',column:'label',unique:true}]);
+ const x=run('CREATE TABLE a (id INTEGER PRIMARY KEY, label TEXT); CREATE INDEX by_label ON a(label)');
+ assert.deepEqual(x.catalog.a.indexes,[{name:'by_label',column:'label',unique:false}]);
+ assert.throws(()=>run('CREATE INDEX by_label ON a(id)',structuredClone(x.catalog),structuredClone(x.tables)),/exists/);
+ assert.throws(()=>run('CREATE INDEX nope ON a(missing)',structuredClone(x.catalog),structuredClone(x.tables)),/Unknown column/);
+ assert.throws(()=>parse('CREATE UNIQUE TABLE a (id INTEGER PRIMARY KEY)'));
+ assert.throws(()=>parse('CREATE INDEX compound ON a(id,label)'));
+});
+test('unique indexes enforce insert/upsert/update and allow repeated NULL',()=>{
+ const x=run("CREATE TABLE a (id INTEGER PRIMARY KEY, label TEXT); CREATE UNIQUE INDEX label_unique ON a(label); INSERT INTO a (id,label) VALUES (1,'one'),(2,'two'),(3,NULL),(4,NULL)");
+ for (const sql of ["INSERT INTO a (id,label) VALUES (5,'one')", "UPSERT INTO a (id,label) VALUES (2,'one')", "UPDATE a SET label='same' WHERE id<=2"]) {
+   assert.throws(()=>run(sql,structuredClone(x.catalog),structuredClone(x.tables)),/Unique index/);
+   assert.deepEqual(x.tables.a.map(r=>r.label),['one','two',null,null]);
+ }
+ const y=run("UPDATE a SET label='changed' WHERE id=1; DELETE FROM a WHERE id=2; INSERT INTO a (id,label) VALUES (5,'two')",structuredClone(x.catalog),structuredClone(x.tables));
+ assert.equal(y.tables.a.at(-1).label,'two');
+});
+test('unique index build rejects existing duplicates, ordinary index permits them',()=>{
+ const x=run("CREATE TABLE a (id INTEGER PRIMARY KEY, label TEXT); INSERT INTO a (id,label) VALUES (1,'same'),(2,'same')");
+ assert.throws(()=>run('CREATE UNIQUE INDEX label_unique ON a(label)',structuredClone(x.catalog),structuredClone(x.tables)),/Unique index/);
+ assert.deepEqual(x.catalog.a.indexes,[]);
+ assert.equal(run('CREATE INDEX label_nonunique ON a(label)',x.catalog,x.tables).catalog.a.indexes.length,1);
+});
+test('range predicates and ORDER BY use numeric rather than encoded lexical ordering',()=>{
+ const x=run('CREATE TABLE n (id REAL PRIMARY KEY); INSERT INTO n (id) VALUES (-10),(-2.5),(0),(2),(10); SELECT * FROM n WHERE id>=-2.5 AND id<10 ORDER BY id DESC');
+ assert.deepEqual(x.results.at(-1).rows,[{id:2},{id:0},{id:-2.5}]);
+});
+test('TEXT uses UTF-8 byte ordering including astral versus BMP private-use characters',()=>{
+ const x=run("CREATE TABLE textkeys (id TEXT PRIMARY KEY); INSERT INTO textkeys (id) VALUES ('😀'),('\uE000'),('a'); SELECT * FROM textkeys ORDER BY id; SELECT * FROM textkeys WHERE id > '\uE000' ORDER BY id");
+ assert.deepEqual(x.results.at(-2).rows.map(r=>r.id),['a','\uE000','😀']);
+ assert.deepEqual(x.results.at(-1).rows,[{id:'😀'}]);
+});
+test('reject unpaired UTF-16 surrogates in data, filters and updates even with no matching rows',()=>{
+ const x=run('CREATE TABLE a (id INTEGER PRIMARY KEY, text TEXT)');
+ for (const invalid of ['\uD800','\uDC00','\uD800x','x\uDC00','\uD800\uD800']) {
+   for (const sql of [`INSERT INTO a (id,text) VALUES (1,'${invalid}')`,`SELECT * FROM a WHERE text='${invalid}'`,`UPDATE a SET text='${invalid}' WHERE id=999`]) {
+     assert.throws(()=>run(sql,structuredClone(x.catalog),structuredClone(x.tables)),/well-formed UTF-16/);
+   }
+ }
+ assert.equal(run("INSERT INTO a (id,text) VALUES (1,'😀')",x.catalog,x.tables).tables.a[0].text,'😀');
+});

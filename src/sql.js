@@ -1,3 +1,4 @@
+import { compareKeys } from './keys.js';
 /** Deliberately bounded SQL subset. No eval, implicit casts, joins or subqueries. */
 export function parse(sql) {
   if (typeof sql !== 'string' || sql.length > 65536) throw new Error('SQL must be a string of at most 65536 characters');
@@ -37,6 +38,11 @@ export function parse(sql) {
     if (take('commit')) { if (!wrapper || committed) throw new Error('Unexpected COMMIT'); committed = true; take(';'); if (pos !== tokens.length) throw new Error('COMMIT must be last'); break; }
     let s;
     if (take('create')) {
+      const unique = take('unique');
+      if (unique || peek() === 'index') {
+        need('index'); const index = name(); need('on'); const table = name(); need('('); const column = name(); need(')');
+        s = {kind:'createIndex',table,index,column,unique};
+      } else {
       need('table'); const table = name(); need('(');
       const columns = list(() => { const column = {name:name(), type:name().toUpperCase(),primaryKey:false,notNull:false};
         if (!['INTEGER','REAL','TEXT','BOOLEAN'].includes(column.type)) throw new Error('Unsupported column type');
@@ -44,6 +50,7 @@ export function parse(sql) {
       }); need(')');
       if (new Set(columns.map(c=>c.name)).size !== columns.length || columns.filter(c=>c.primaryKey).length !== 1) throw new Error('Require unique column names and exactly one inline PRIMARY KEY');
       s = {kind:'create',table,columns};
+      }
     } else if (['insert','upsert'].includes(peek())) {
       const kind = tokens[pos++].value; need('into'); const table = name(); need('('); const columns = list(name); need(')'); need('values');
       const values = list(() => { need('('); const row = list(literal); need(')'); return row; });
@@ -74,18 +81,49 @@ export function execute(statements, catalog, tables) {
     if (v === null) { if (c.notNull || c.primaryKey) throw new Error(`${c.name} cannot be NULL`); return; }
     const valid = c.type === 'INTEGER' ? Number.isSafeInteger(v) : c.type === 'REAL' ? typeof v === 'number' && Number.isFinite(v) : c.type === 'BOOLEAN' ? typeof v === 'boolean' : typeof v === 'string';
     if (!valid) throw new Error(`Invalid ${c.type} value for ${c.name}`);
-    if (typeof v === 'string' && v.length > 8192) throw new Error('Text exceeds 8192 characters');
+    if (typeof v === 'string') {
+      if (v.length > 8192) throw new Error('Text exceeds 8192 characters');
+      // UTF-8 replacement of lone UTF-16 surrogates would alias distinct keys.
+      for (let i = 0; i < v.length; i++) {
+        const code = v.charCodeAt(i);
+        if (code >= 0xd800 && code <= 0xdbff) {
+          const low = v.charCodeAt(++i);
+          if (!(low >= 0xdc00 && low <= 0xdfff)) throw new Error('TEXT requires well-formed UTF-16');
+        } else if (code >= 0xdc00 && code <= 0xdfff) throw new Error('TEXT requires well-formed UTF-16');
+      }
+    }
+  };
+  const validateIndexes = (schema, rows) => {
+    for (const index of schema.indexes || []) {
+      if (!index.unique) continue;
+      const seen = new Set();
+      for (const row of rows) {
+        const value = row[index.column];
+        if (value === null) continue;
+        if (seen.has(value)) throw new Error(`Unique index ${index.name} violation`);
+        seen.add(value);
+      }
+    }
   };
   for (const s of statements) {
     if (s.kind === 'create') {
       if (Object.hasOwn(catalog,s.table)) throw new Error(`Table ${s.table} exists`);
       if (Object.keys(catalog).length >= 32) throw new Error('At most 32 tables');
-      catalog[s.table] = {columns:s.columns,primaryKey:s.columns.find(c=>c.primaryKey).name,shards:4}; tables[s.table] = []; results.push({rowsAffected:0}); continue;
+      catalog[s.table] = {columns:s.columns,primaryKey:s.columns.find(c=>c.primaryKey).name,indexes:[]}; tables[s.table] = []; results.push({rowsAffected:0}); continue;
     }
     const schema = Object.hasOwn(catalog,s.table) && catalog[s.table]; if (!schema) throw new Error(`Unknown table ${s.table}`);
     const rows = tables[s.table]; const pk = schema.primaryKey;
+    if (s.kind === 'createIndex') {
+      known(schema,s.column);
+      const indexes = schema.indexes || [];
+      if (indexes.some(index => index.name === s.index)) throw new Error(`Index ${s.index} exists`);
+      if (indexes.length >= 16) throw new Error('At most 16 indexes per table');
+      schema.indexes = [...indexes,{name:s.index,column:s.column,unique:s.unique}];
+      validateIndexes(schema,rows);
+      results.push({rowsAffected:0}); continue;
+    }
     for (const f of s.filter || []) { const c = known(schema,f.column); check({...c,notNull:false,primaryKey:false},f.value); }
-    const matches = row => (s.filter || []).every(f => { const a = row[f.column], b = f.value; if (a === null || b === null) return false; switch(f.op) { case '=': return a === b; case '!=': case '<>': return a !== b; case '<': return a < b; case '>': return a > b; case '<=': return a <= b; case '>=': return a >= b; } });
+    const matches = row => (s.filter || []).every(f => { const a = row[f.column], b = f.value; if (a === null || b === null) return false; switch(f.op) { case '=': return a === b; case '!=': case '<>': return a !== b; case '<': return compareKeys(a,b) < 0; case '>': return compareKeys(a,b) > 0; case '<=': return compareKeys(a,b) <= 0; case '>=': return compareKeys(a,b) >= 0; } });
     if (s.kind === 'insert' || s.kind === 'upsert') {
       if (new Set(s.columns).size !== s.columns.length) throw new Error('Duplicate insert column'); s.columns.forEach(c=>known(schema,c));
       for (const values of s.values) {
@@ -98,12 +136,19 @@ export function execute(statements, catalog, tables) {
     } else if (s.kind === 'select') {
       if (s.columns !== '*') { s.columns.forEach(c=>known(schema,c)); if (new Set(s.columns).size !== s.columns.length) throw new Error('Duplicate projection column'); }
       let selected = rows.filter(matches);
-      if (s.order) { known(schema,s.order.column); selected.sort((a,b) => { const x=a[s.order.column],y=b[s.order.column]; return (x === y ? 0 : x === null ? -1 : y === null ? 1 : x < y ? -1 : 1)*(s.order.desc?-1:1); }); }
+      if (s.order) { known(schema,s.order.column); selected.sort((a,b) => { const x=a[s.order.column],y=b[s.order.column]; return compareKeys(x,y)*(s.order.desc?-1:1); }); }
       if (s.limit !== null) selected = selected.slice(0,s.limit);
       results.push({rows:selected.map(row=>Object.fromEntries((s.columns === '*' ? schema.columns.map(c=>c.name) : s.columns).map(c=>[c,row[c]])))});
     } else if (s.kind === 'update') {
       if (new Set(s.assignments.map(a=>a.column)).size !== s.assignments.length) throw new Error('Duplicate update column');
-      for (const a of s.assignments) { known(schema,a.column); if (a.column === pk) throw new Error('Primary key updates are not supported'); if (a.expression.column) known(schema,a.expression.column); }
+      for (const a of s.assignments) {
+        const target = known(schema,a.column);
+        if (a.column === pk) throw new Error('Primary key updates are not supported');
+        if (a.expression.column) {
+          const source = known(schema,a.expression.column);
+          if (a.expression.op && (!['INTEGER','REAL'].includes(source.type) || typeof a.expression.value !== 'number' || !Number.isFinite(a.expression.value))) throw new Error('Arithmetic requires numeric operands');
+        } else check(target,a.expression.value);
+      }
       let count = 0;
       tables[s.table] = rows.map(row => { if (!matches(row)) return row; const next = {...row};
         for (const {column,expression:e} of s.assignments) { let value = e.column ? row[e.column] : e.value;
@@ -113,6 +158,7 @@ export function execute(statements, catalog, tables) {
       }); results.push({rowsAffected:count});
     } else if (s.kind === 'delete') { tables[s.table] = rows.filter(r=>!matches(r)); results.push({rowsAffected:rows.length-tables[s.table].length}); }
     else throw new Error('Unknown AST statement');
+    if (['insert','upsert','update'].includes(s.kind)) validateIndexes(schema,tables[s.table]);
   }
   return {catalog,tables,results};
 }

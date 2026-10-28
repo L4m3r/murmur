@@ -1,85 +1,41 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Coordinator, RowShard, Catalog } from '../src/index.js';
+import Worker,{Coordinator,DataShard,Mediator} from '../src/index.js';
 
-// Deterministic protocol model. Runtime durability is exercised separately by
-// celld process-restart integration tests, not asserted by this memory double.
-function storage() {
-  const data = new Map();
-  const api = {
-    get: async key => structuredClone(data.get(key)),
-    put: async (key, value) => { data.set(key, structuredClone(value)); },
-    delete: async key => data.delete(key),
-    list: async ({prefix = ''} = {}) => new Map([...data].filter(([k]) => k.startsWith(prefix)).sort().map(([k,v])=>[k,structuredClone(v)])),
-    transaction: async fn => {
-      const backup = structuredClone(data);
-      try { return await fn(api); }
-      catch (error) { data.clear(); for (const [k,v] of backup) data.set(k,v); throw error; }
-    },
-  };
-  return api;
+// Memory protocol model only; process durability is covered by celld E2E tests.
+function storage(){
+ const data=new Map();let alarm=null;
+ const api={
+  async get(key){return Array.isArray(key)?new Map(key.filter(k=>data.has(k)).map(k=>[k,structuredClone(data.get(k))])):structuredClone(data.get(key));},
+  async put(key,value){if(typeof key==='object'){for(const[k,v]of Object.entries(key))data.set(k,structuredClone(v));}else data.set(key,structuredClone(value));},
+  async delete(key){if(Array.isArray(key)){let count=0;for(const k of key)count+=data.delete(k);return count;}return data.delete(key);},
+  async list({prefix='',start,end,limit,reverse=false}={}){let result=[...data].filter(([k])=>k.startsWith(prefix)&&(start===undefined||k>=start)&&(end===undefined||k<end)).sort(([a],[b])=>a<b?-1:a>b?1:0);if(reverse)result.reverse();if(limit!==undefined)result=result.slice(0,limit);return new Map(result.map(([k,v])=>[k,structuredClone(v)]));},
+  async transaction(fn){const backup=structuredClone(data);try{return await fn(api);}catch(error){data.clear();for(const[k,v]of backup)data.set(k,v);throw error;}},
+  async setAlarm(value){alarm=value;},async getAlarm(){return alarm;},async deleteAlarm(){alarm=null;}
+ };return api;
 }
-const request = body => new Request('https://actor/query', {method:'POST',body:JSON.stringify(body)});
-async function invoke(actor, body) { const response = await actor.fetch(request(body)); return { status:response.status, body:await response.json() }; }
-function cluster() {
-  function namespace(Type) {
-    const actors = new Map();
-    return { idFromName:name=>name, get(name) {
-      if (!actors.has(name)) actors.set(name,new Type({storage:storage()}));
-      return {fetch:(_url,init)=>actors.get(name).fetch(new Request('https://actor',init))};
-    }};
-  }
-  const state={storage:storage()}, env={CATALOG:namespace(Catalog),ROWS:namespace(RowShard),ALLOW_FAULTS:'true'};
-  let actor=new Coordinator(state,env), sequence=0;
-  return {restart(){actor=new Coordinator(state,env);},query(sql,extra={}){return invoke(actor,{sql,idempotencyKey:`k${++sequence}`,...extra});}};
+function cluster(){
+ const env={ALLOW_FAULTS:'true',TABLET_SPLIT_BYTES:'1024',TABLET_MERGE_BYTES:'256'},namespaces=[];
+ function namespace(Type){const states=new Map(),actors=new Map();const ns={idFromName:name=>name,get(name){return{async fetch(url,init){if(!states.has(name))states.set(name,{storage:storage(),id:{name,toString:()=>name},blockConcurrencyWhile:fn=>fn()});if(!actors.has(name))actors.set(name,new Type(states.get(name),env));return actors.get(name).fetch(new Request(url,init));}};},reset(){actors.clear();}};namespaces.push(ns);return ns;}
+ env.SHARDS=namespace(DataShard);env.MEDIATOR=namespace(Mediator);env.COORDINATOR=namespace(Coordinator);
+ let sequence=0;return{restart(){namespaces.forEach(ns=>ns.reset());},async post(path,body={}){const response=await Worker.fetch(new Request(`http://127.0.0.1${path}`,{method:'POST',body:JSON.stringify(body)}),env);return{status:response.status,body:await response.json()};},query(sql,extra={}){return this.post('/query',{sql,idempotencyKey:`request_${++sequence}`,...extra});}};
 }
-test('durable abort fences a delayed prepare even after participant reset',async()=>{
-  const state={storage:storage()}; let actor=new RowShard(state);
-  assert.equal((await invoke(actor,{op:'abort',id:'old',version:1})).status,200);
-  actor=new RowShard(state);
-  assert.equal((await invoke(actor,{op:'prepare',id:'old',version:1,primaryKey:'id',value:[{id:1}]})).status,500);
-  assert.equal((await invoke(actor,{op:'prepare',id:'new',version:1,primaryKey:'id',value:[{id:2}]})).status,200);
-  assert.equal((await invoke(actor,{op:'commit',id:'new',version:1})).status,200);
-  assert.deepEqual((await invoke(actor,{op:'read'})).body.value,[{id:2}]);
+for(const fault of ['after-prepare','after-commit-ready','after-plan','after-first-commit'])test(`MVCC coordinator reset ${fault} preserves snapshot and resolves durable intent`,async()=>{
+ const db=cluster();let result=await db.query('CREATE TABLE a(id INTEGER PRIMARY KEY,n INTEGER); INSERT INTO a(id,n) VALUES (1,10),(2,10)');assert.equal(result.status,200,JSON.stringify(result.body));
+ const before=(await db.post('/snapshot')).body.frontier;
+ const sql='UPDATE a SET n=n-1 WHERE id=1; UPDATE a SET n=n+1 WHERE id=2';
+ result=await db.query(sql,{fault,idempotencyKey:'transfer'});assert.equal(result.status,503,JSON.stringify(result.body));
+ db.restart();
+ assert.deepEqual((await db.query('SELECT n FROM a ORDER BY id',{snapshot:before})).body.results[0].rows,[{n:10},{n:10}]);
+ assert.equal((await db.post('/recover')).status,200);
+ assert.deepEqual((await db.query('SELECT n FROM a ORDER BY id')).body.results[0].rows,fault==='after-prepare'?[{n:10},{n:10}]:[{n:9},{n:11}]);
+ const replay=await db.query(sql,{idempotencyKey:'transfer'});assert.equal(replay.status,200);assert.deepEqual(await db.query(sql,{idempotencyKey:'transfer'}),replay);
+ assert.equal((await db.query('SELECT * FROM a',{idempotencyKey:'transfer'})).status,409);
 });
-test('participant commit replay cannot revert newer rows; deleted row keys disappear',async()=>{
-  const actor=new RowShard({storage:storage()});
-  for (const [id,version,value] of [['a',1,[{id:1},{id:2}]],['b',2,[{id:2}]]]) {
-    assert.equal((await invoke(actor,{op:'prepare',id,version,primaryKey:'id',value})).status,200);
-    assert.equal((await invoke(actor,{op:'commit',id,version})).status,200);
-  }
-  assert.equal((await invoke(actor,{op:'commit',id:'a',version:1})).status,200);
-  assert.deepEqual((await invoke(actor,{op:'read'})).body,{version:2,value:[{id:2}]});
-});
-for (const fault of ['after-prepare','after-decision','after-first-commit']) test(`coordinator reset ${fault}: recovery precedes read, replay exactly once`,async()=>{
-  const db=cluster();
-  assert.equal((await db.query('CREATE TABLE a (id INTEGER PRIMARY KEY, balance INTEGER); INSERT INTO a (id,balance) VALUES (1,100),(2,100)')).status,200);
-  const sql='UPDATE a SET balance=balance-7 WHERE id=1; UPDATE a SET balance=balance+7 WHERE id=2';
-  assert.equal((await db.query(sql,{fault,idempotencyKey:'transfer'})).status,503);
-  db.restart();
-  const read=await db.query('SELECT * FROM a ORDER BY id');
-  assert.deepEqual(read.body.results[0].rows.map(r=>r.balance),fault==='after-prepare'?[100,100]:[93,107]);
-  const first=await db.query(sql,{idempotencyKey:'transfer'});
-  assert.equal(first.status,200);
-  assert.deepEqual(await db.query(sql,{idempotencyKey:'transfer'}),first);
-  assert.equal((await db.query('SELECT * FROM a',{idempotencyKey:'transfer'})).status,409);
-  assert.deepEqual((await db.query('SELECT * FROM a ORDER BY id')).body.results[0].rows.map(r=>r.balance),[93,107]);
-});
-test('concurrent transfers and reads expose only whole transactions',async()=>{
-  const db=cluster();
-  await db.query('CREATE TABLE a (id INTEGER PRIMARY KEY, balance INTEGER); INSERT INTO a (id,balance) VALUES (1,100),(2,100)');
-  const tasks=[];
-  for(let i=0;i<20;i++) {
-    tasks.push(db.query('UPDATE a SET balance=balance-1 WHERE id=1; UPDATE a SET balance=balance+1 WHERE id=2').then(r=>assert.equal(r.status,200)));
-    tasks.push(db.query('SELECT * FROM a ORDER BY id').then(r=>assert.equal(r.body.results[0].rows.reduce((n,row)=>n+row.balance,0),200)));
-  }
-  await Promise.all(tasks);
-  assert.deepEqual((await db.query('SELECT * FROM a ORDER BY id')).body.results[0].rows.map(r=>r.balance),[80,120]);
-});
-test('UTF8 oversized durable envelope rejected before any write',async()=>{
-  const db=cluster();
-  const text='界'.repeat(8000);
-  const r=await db.query(`CREATE TABLE a (id INTEGER PRIMARY KEY, text TEXT); INSERT INTO a (id,text) VALUES (1,'${text}'),(2,'${text}'); SELECT * FROM a`);
-  assert.equal(r.status,400);
-  assert.equal((await db.query('SELECT * FROM a')).status,400);
+test('MVCC tombstone leaves old snapshot readable after actor resets',async()=>{
+ const db=cluster();assert.equal((await db.query('CREATE TABLE a(id INTEGER PRIMARY KEY,n INTEGER); INSERT INTO a(id,n) VALUES (1,3)')).status,200);
+ const before=(await db.post('/snapshot')).body.frontier;
+ assert.equal((await db.query('DELETE FROM a WHERE id=1')).status,200);db.restart();
+ assert.deepEqual((await db.query('SELECT * FROM a')).body.results[0].rows,[]);
+ assert.deepEqual((await db.query('SELECT * FROM a',{snapshot:before})).body.results[0].rows,[{id:1,n:3}]);
 });

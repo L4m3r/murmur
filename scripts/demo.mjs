@@ -6,7 +6,8 @@ async function run(sql) {
   const result = await response.json();
   console.log(`\nSQL> ${sql}\n${JSON.stringify(result, null, 2)}`);
   if (!response.ok) throw new Error('Demo query failed');
+  return result;
 }
 await run(`CREATE TABLE ${table} (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, balance INTEGER NOT NULL); INSERT INTO ${table} (id,owner,balance) VALUES (1,'Ada',100),(2,'Grace',100)`);
-await run(`BEGIN; UPDATE ${table} SET balance = balance - 25 WHERE id = 1; UPDATE ${table} SET balance = balance + 25 WHERE id = 2; SELECT * FROM ${table} ORDER BY id; COMMIT;`);
-console.log('\nCommitted an atomic transfer across separate Durable Object row shards.');
+const transfer = await run(`BEGIN; UPDATE ${table} SET balance = balance - 25 WHERE id = 1; UPDATE ${table} SET balance = balance + 25 WHERE id = 2; SELECT * FROM ${table} ORDER BY id; COMMIT;`);
+console.log(`\nCommitted an atomic transfer using coordinator ${transfer.coordinatorId}; row tablets touched: ${transfer.participants.filter(p => p.name.startsWith('base/')).length}.`);

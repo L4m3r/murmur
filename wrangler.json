@@ -1,12 +1,36 @@
 {
-  "name": "actor-row-db",
+  "name": "murmur-mvcc-v4",
   "main": "src/index.js",
   "compatibility_date": "2026-01-01",
-  "durable_objects": { "bindings": [
-    { "name": "CATALOG", "class_name": "Catalog" },
-    { "name": "ROWS", "class_name": "RowShard" },
-    { "name": "COORDINATOR", "class_name": "Coordinator" }
-  ] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Catalog", "RowShard", "Coordinator"] }],
-  "vars": { "ALLOW_FAULTS": "false" }
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SHARDS",
+        "class_name": "DataShard"
+      },
+      {
+        "name": "MEDIATOR",
+        "class_name": "Mediator"
+      },
+      {
+        "name": "COORDINATOR",
+        "class_name": "Coordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v4-initial",
+      "new_sqlite_classes": [
+        "DataShard",
+        "Mediator",
+        "Coordinator"
+      ]
+    }
+  ],
+  "vars": {
+    "ALLOW_FAULTS": "false",
+    "TABLET_SPLIT_BYTES": "4096",
+    "TABLET_MERGE_BYTES": "1024"
+  }
 }
