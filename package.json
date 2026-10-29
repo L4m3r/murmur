@@ -19,12 +19,14 @@
     "test:query-pagination": "bash scripts/test-query-pagination.sh",
     "benchmark:protocol": "node scripts/benchmark-protocol.mjs",
     "benchmark": "node scripts/benchmark.mjs",
-    "test:coordinator-pool": "bash scripts/test-coordinator-pool.sh && POOL_TEST_MODE=transactions bash scripts/test-coordinator-pool.sh"
+    "test:coordinator-pool": "bash scripts/test-coordinator-pool.sh && POOL_TEST_MODE=transactions bash scripts/test-coordinator-pool.sh",
+    "test:observability": "bash scripts/test-observability.sh"
   },
   "engines": {
     "node": ">=20"
   },
   "devDependencies": {
-    "esbuild": "0.28.2"
+    "esbuild": "0.28.2",
+    "playwright-core": "1.62.1"
   }
 }

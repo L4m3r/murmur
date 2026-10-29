@@ -527,7 +527,33 @@ export class DataShard {
     });
     return json({ ...result, collectionFloor, rejectBeforeEpoch, floor: collectionFloor, nextCursor: result.done ? null : btoa(JSON.stringify(position)) });
   }
+  async catalogDiagnostics(input) {
+    const {snapshot}=input,offset=input.offset??0,limit=input.limit??8;
+    if(!Number.isSafeInteger(snapshot)||snapshot<0||!Number.isSafeInteger(offset)||offset<0||!Number.isSafeInteger(limit)||limit<1||limit>8||(input.index!==undefined&&(typeof input.index!=='string'||!input.index.length||input.index.length>128)))return json({error:'Invalid catalog diagnostic page'},400);
+    const floor=await this.storage.get('collectionFloor')||0;
+    if(snapshot<floor)return json({error:'Diagnostic snapshot expired',code:'SNAPSHOT_EXPIRED',collectionFloor:floor},410);
+    const metadata=await this.meta(this.storage,snapshot);
+    if(metadata.retired)return json({error:'Catalog is retired at snapshot',code:'CATALOG_NOT_FOUND'},404);
+    const version=await this.version(this.storage,'schema',snapshot),schema=version?.row;
+    if(!schema||schema.state==='dropped')return json({error:'Catalog not found at snapshot',code:'CATALOG_NOT_FOUND'},404);
+    const columns=schema.columns||[],indexes=schema.indexes||[];
+    const indexSummary=index=>({name:index.name,storageName:index.storageName||index.name,column:index.column,unique:index.unique===true,state:index.state||'ready',epoch:index.epoch,keyColumns:(index.keyColumns||[]).slice(0,64),totalTablets:(index.tablets||[]).length});
+    const selected=input.index===undefined?schema:indexes.find(index=>index.name===input.index);
+    if(!selected||selected.state==='dropped')return json({error:'Index not found at snapshot',code:'CATALOG_NOT_FOUND'},404);
+    const descriptors=selected.tablets||[],tablets=descriptors.slice(offset,offset+limit).map(t=>({id:t.id,epoch:t.epoch??selected.epoch,lowerUnbounded:t.start===null,upperUnbounded:t.end===null}));
+    const result={kind:'catalog',snapshot,schema:{storageName:schema.storageName,epoch:schema.epoch,state:schema.state||'ready',primaryKey:schema.primaryKey,primaryKeys:(schema.primaryKeys||[schema.primaryKey]).slice(0,64),columnCount:columns.length,columnsTruncated:columns.length>64,indexCount:indexes.length,indexesTruncated:indexes.length>64,columns:columns.slice(0,64).map(c=>({name:c.name,type:c.type,nullable:!(c.notNull||c.primaryKey),primaryKey:c.primaryKey===true})),indexes:indexes.slice(0,64).map(indexSummary)},selection:{index:input.index??null,storageName:input.index===undefined?schema.storageName:(selected.storageName||selected.name),epoch:selected.epoch,totalTablets:descriptors.length,tablets,nextOffset:offset+tablets.length<descriptors.length?offset+tablets.length:null}};
+    if(jsonBytes(result)>65536)return json({error:'Diagnostic schema summary exceeds bounded output',code:'DIAGNOSTIC_BUDGET'},413);
+    return json(result);
+  }
+  async diagnostics() {
+    // Count only bounded roots; never decode intents or enumerate row history.
+    const stats=await this.storage.get('stats')||{},meta=await this.meta(this.storage);
+    const pending=await this.storage.list({prefix:'pending:',limit:17}),footprints=await this.storage.list({prefix:'foot:',limit:17});
+    const count=roots=>({count:Math.min(16,roots.size),truncated:roots.size>16});
+    return json({kind:'shard',stats:{rows:stats.rows||0,bytes:stats.bytes??2,payloadBytes:stats.payloadBytes||0},metadata:{epoch:meta.epoch??0,retired:meta.retired===true,step:meta.step??0},collectionFloor:await this.storage.get('collectionFloor')||0,rejectBeforeEpoch:await this.storage.get('rejectBeforeEpoch')||0,pending:count(pending),footprints:count(footprints)});
+  }
   async handle(input) {
+    if(input.op==='diagnostics')return input.catalog===true?this.catalogDiagnostics(input):this.diagnostics();
     if(input.op==='propose')return this.propose(input);
     if(input.op==='proposal'){const epoch=requestEpoch(input.id);await rpc(this.env.ALLOCATOR,'global',{op:'epoch',requestEpoch:epoch});const floor=await this.storage.get('rejectBeforeEpoch')||0;if(epoch<floor)throw requestExpired(floor);return json(await this.storage.get(`proposal:${input.id}`)||{missing:true});}
     if(input.op==='abort')return this.abortUnassigned(input);

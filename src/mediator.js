@@ -262,6 +262,7 @@ export class PlanAllocator extends AllocationControl {
   async fetch(request) {
     try {
       const input=await request.json();
+      if(input.op==='diagnostics')return await this.local(()=>this.diagnostics(input));
       if(input.op==='assign') return json(await this.assign(input));
       if(input.op==='drive') return json(await this.drive());
       if(input.op==='completion') return json(await this.completion(input));
@@ -271,6 +272,22 @@ export class PlanAllocator extends AllocationControl {
         return this.handle(input);
       });
     } catch(error) { return json({error:error.message,code:error.code||'ALLOCATOR_ERROR',rpc:error.rpc,retryAfterMs:error.retryAfterMs,retryable:(error.status||503)>=500},error.status||503); }
+  }
+  async diagnostics(input) {
+    // Never call status/lookup: those advance frontiers or enter transactions.
+    if(input.id!==undefined){
+      if(typeof input.id!=='string'||!input.id.length||input.id.length>128)return json({error:'Invalid diagnostic transaction id'},400);
+      const plan=await this.storage.get(`plan:${input.id}`);
+      if(!plan)return json({kind:'allocator',transaction:{id:input.id,state:await this.storage.get(`unassigned-abort:${input.id}`)?'aborted':'absent'}});
+      const a=plan.association||plan;
+      return json({kind:'allocator',transaction:{state:'assigned',id:input.id,step:a.step,epoch:a.epoch,bucket:a.bucket,participantCount:a.participants.length,participants:a.participants.slice(0,64).map(p=>p.name)}});
+    }
+    const limit=input.limit??16,cursor=input.cursor??0;
+    if(!Number.isSafeInteger(limit)||limit<1||limit>16||!Number.isSafeInteger(cursor)||cursor<0)return json({error:'Invalid diagnostic page'},400);
+    const summary={kind:'allocator'};
+    for(const key of ['allocated','frontier','deliveredFrontier','retentionFloor','currentEpoch','rejectBeforeEpoch','pinCount','leaseCount'])summary[key]=await this.storage.get(key)||0;
+    const page=await this.pendingPage({limit,cursor});
+    return json({...summary,pending:page.pending.map(p=>({id:p.id,step:p.step,epoch:p.epoch??0})),nextCursor:page.nextCursor});
   }
   async lookup(input) {
     if(typeof input.id!=='string'||!input.id.length||input.id.length>128) return json({error:'Invalid transaction id'},400);

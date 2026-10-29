@@ -9,6 +9,7 @@ export class PlanBucket {
   async fetch(request) {
     try {
       const input=await request.json();
+      if(input.op==='diagnostics')return await this.local(()=>this.diagnostics(input));
       if(input.op==='collect') return json(await this.collect(input));
       if(input.op==='register') return json(await this.register(input.association));
       if(input.op==='drive') return json(await this.drive(input.id,input.release===true,input));
@@ -19,6 +20,13 @@ export class PlanBucket {
       if(['delivered','applied'].includes(input.op)) return json(await this.ack(input));
       return json({error:'Unknown bucket operation'},400);
     } catch(error) {return json({error:error.message,code:error.code||'BUCKET_ERROR',rpc:error.rpc,retryAfterMs:error.retryAfterMs,retryable:(error.status||503)>=500},error.status||503);}
+  }
+  async diagnostics(input) {
+    if(typeof input.id!=='string'||!input.id.length||input.id.length>128)return json({error:'Diagnostic transaction id required'},400);
+    const record=await this.storage.get(`plan:${input.id}`);
+    if(!record)return json({kind:'bucket',transaction:null});
+    const a=record.association,names=a.participants.map(p=>p.name),undelivered=names.filter(name=>!record.delivered.includes(name)),unapplied=names.filter(name=>!record.applied.includes(name));
+    return json({kind:'bucket',transaction:{id:a.id,step:a.step,epoch:a.epoch,participantCount:names.length,deliveredCount:record.delivered.length,appliedCount:record.applied.length,decision:record.decision?.outcome??null,undelivered:undelivered.slice(0,16),unapplied:unapplied.slice(0,16),truncated:undelivered.length>16||unapplied.length>16}});
   }
   async register(a) {
     if(!a||typeof a.id!=='string') throw Object.assign(new Error('Association required'),{status:400});

@@ -1,3 +1,5 @@
+import { diagnosticsResponse, observeRequest } from './observability.js';
+import { dashboardResponse } from './observability-ui.js';
 import { decodeRpcResponse } from './rpc-response.js';
 import { CoordinatorService } from './coordinator-service.js';
 import { coordinatorName, COORDINATOR_POOL_SIZE } from './coordinator-routing.js';
@@ -444,7 +446,7 @@ async function helpDependencies(env,result){
  for(const dependency of result.dependencies||[]){const assigned=await mediator(env,{op:'lookup',id:dependency.id});if(assigned.state==='assigned'){await actorCall(env.MEDIATORS,assigned.association.bucket,{op:'register',association:assigned.association});await actorCall(env.MEDIATORS,assigned.association.bucket,{op:'drive',id:dependency.id,release:true});}}
  if(result.owners?.length)await recoverOwners(env,result.owners.filter(Boolean));
 }
-export default {
+const worker = {
   async fetch(request,env){
     const url=new URL(request.url);
     if(url.pathname==='/health'&&request.method==='GET')return json({ok:true,engine:'murmur-services-v7',coordinators:'independent-context-pool',coordinatorServices:COORDINATOR_POOL_SIZE});
@@ -564,5 +566,23 @@ export default {
       }
       return json({error:'Serialization conflict; retry same key',code:'CONFLICT',retryable:true},503);
     }catch(error){return json({error:error.message,code:error.code||'RECOVERY_REQUIRED',retryable:![400,410].includes(error.status),rpc:error.rpc,retryAfterMs:error.retryAfterMs},error.status||503);}
+  }
+};
+
+
+// The dashboard shell contains no data. Every diagnostic API call independently
+// authenticates; normal query responses are observed without retaining SQL/rows.
+export default {
+  async fetch(request,env,ctx){
+    const path=new URL(request.url).pathname;
+    if(path==='/observe'||path==='/observe/')return request.method==='GET'?dashboardResponse():Response.json({error:'GET required'},{status:405});
+    if(path==='/observe/api')return diagnosticsResponse(request,env);
+    const started=Date.now(),response=await worker.fetch(request,env,ctx);
+    if(request.method!=='POST')return response;
+    // Own API replies are bounded JSON. Consume once: proxied celld streams
+    // cannot necessarily be cloned, and no parsed payload is retained.
+    const result=await response.json();
+    observeRequest(env,path,response.status,Date.now()-started,result);
+    return Response.json(result,{status:response.status,headers:response.headers});
   }
 };
